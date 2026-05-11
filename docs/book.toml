@@ -1,0 +1,14 @@
+[book]
+title = "dispcli"
+authors = []
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/prmanahan/dispcli"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.d2]
+command = "mdbook-d2"

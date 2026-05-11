@@ -1,4 +1,4 @@
-# Justfile for rust-template.
+# Justfile for dispcli.
 # Run `just --list` to see available recipes.
 
 # Default recipe — show help
@@ -34,3 +34,14 @@ build:
 # Build all workspace members in release mode.
 release:
     cargo build --workspace --release
+
+# Build the docs site.
+# Requires: mdbook, mdbook-mermaid, mdbook-d2, and the d2 CLI on PATH.
+# Install via: cargo install --locked mdbook mdbook-mermaid mdbook-d2
+# d2 CLI: https://d2lang.com/tour/install
+docs:
+    mdbook build docs/
+
+# Serve the docs site locally with live reload.
+docs-serve:
+    mdbook serve docs/
