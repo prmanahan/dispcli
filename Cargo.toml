@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "cmd/dispcli",
+    "libs/dispcli-core",
+    "libs/dispcli-io",
+]
+
+[workspace.package]
+edition    = "2024"
+version    = "0.1.0"
+authors    = ["Peter Manahan"]
+license    = "MIT"
+
+[workspace.dependencies]
+# Core deps — reference via `dep.workspace = true` in member crates
+anyhow    = { version = "1", features = ["std"] }
+thiserror = "2"
+clap      = { version = "4", features = ["derive"] }
+
+# Test deps
+assert_cmd = "2"
+tempfile   = "3"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+strip         = "symbols"
+codegen-units = 1
+
+# ─── Strict clippy lint set ────────────────────────────────────────────────────
+# Source: https://emschwartz.me/your-clippy-config-should-be-stricter/
+# Applied workspace-wide; CI enforces with `-D warnings`.
+# Every member crate opts in via `[lints] workspace = true`.
+# Suppressions must use `#[expect(..., reason = "…")]`, NOT `#[allow(...)]`.
+[workspace.lints.clippy]
+
+# Don't panic ──────────────────────────────────────────────────────────────────
+string_slice              = "warn"
+indexing_slicing          = "warn"
+unwrap_used               = "warn"
+expect_used               = "warn"
+panic                     = "warn"
+todo                      = "warn"
+unimplemented             = "warn"
+unreachable               = "warn"
+get_unwrap                = "warn"
+unwrap_in_result          = "warn"
+unchecked_time_subtraction = "warn"
+panic_in_result_fn        = "warn"
+
+# Don't fail silently ──────────────────────────────────────────────────────────
+let_underscore_future     = "warn"
+let_underscore_must_use   = "warn"
+unused_result_ok          = "warn"
+map_err_ignore            = "warn"
+assertions_on_result_states = "warn"
+
+# Don't do bad async ───────────────────────────────────────────────────────────
+await_holding_lock        = "warn"
+await_holding_refcell_ref = "warn"
+large_futures             = "warn"
+# if_let_mutex omitted — fixed by 2024 edition scoping
+
+# Memory safety ────────────────────────────────────────────────────────────────
+mem_forget                  = "warn"
+undocumented_unsafe_blocks  = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_doc      = "warn"
+unnecessary_safety_comment  = "warn"
+
+# Numbers ──────────────────────────────────────────────────────────────────────
+float_cmp               = "warn"
+float_cmp_const         = "warn"
+lossy_float_literal     = "warn"
+cast_sign_loss          = "warn"
+invalid_upcast_comparisons = "warn"
+
+# Easy avoidance ───────────────────────────────────────────────────────────────
+rc_mutex                      = "warn"
+debug_assert_with_mut_call    = "warn"
+iter_not_returning_iterator   = "warn"
+expl_impl_clone_on_copy       = "warn"
+infallible_try_from           = "warn"
+dbg_macro                     = "warn"
+
+# Suppression discipline ───────────────────────────────────────────────────────
+# Every suppression must be `#[expect(..., reason = "…")]`, not `#[allow]`.
+allow_attributes              = "warn"
+allow_attributes_without_reason = "warn"
+
+# ─── Optional lints (commented out — enable per-project as needed) ─────────────
+# arithmetic_side_effects  = "warn"  # noisy: ~85% false positives per article
+# cast_possible_wrap       = "warn"  # force documenting numeric invariants
+# cast_precision_loss      = "warn"  # force documenting numeric invariants
+# cast_possible_truncation = "warn"  # force documenting numeric invariants

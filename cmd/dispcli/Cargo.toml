@@ -1,0 +1,22 @@
+[package]
+name    = "dispcli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dispcli"
+path = "./main.rs"
+
+[dependencies]
+dispcli-core = { path = "../../libs/dispcli-core" }
+dispcli-io   = { path = "../../libs/dispcli-io" }
+clap         = { workspace = true }
+anyhow       = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+# Workspace-root clippy.toml — carve-outs for test code.
+# These settings apply when clippy runs with --all-targets (i.e., test code is included).
+# Production paths still enforce the full strict lint set from Cargo.toml [workspace.lints.clippy].
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests            = true
+allow-unwrap-in-tests           = true
+allow-expect-in-tests           = true
+allow-dbg-in-tests              = true

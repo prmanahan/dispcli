@@ -1,0 +1,13 @@
+[package]
+name    = "dispcli-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "dispcli_core"
+path = "./dispcli_core.rs"
+
+[lints]
+workspace = true

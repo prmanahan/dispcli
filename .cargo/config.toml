@@ -1,0 +1,17 @@
+# Faster dev builds via lld linker.
+# lld must be installed (e.g., via llvm package).
+# On macOS: `brew install llvm` then add to PATH.
+# On Debian/Ubuntu: `apt install lld`.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-apple-darwin]
+# lld on Apple Silicon via Homebrew llvm:
+#   brew install llvm
+#   export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+# Uncomment when lld is available:
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

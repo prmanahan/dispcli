@@ -1,0 +1,61 @@
+# dispcli — contributor notes
+
+Auto-loaded at session start. Codifies the conventions an agent or human
+contributor must follow when changing this repo.
+
+## Architecture
+
+Three crates, strict separation:
+
+| Crate | Role | IO |
+|---|---|---|
+| `libs/dispcli-core` | Dispatch-envelope construction. Types, traits, assembly logic. | **IO-free.** No `std::fs`, `std::process`, stdin/stdout. |
+| `libs/dispcli-io` | Native IO adapters implementing core traits (filesystem skill resolution, envelope writes, etc.). | Native only. |
+| `cmd/dispcli` | Binary. Parses args, wires `dispcli-io` adapters into `dispcli-core` logic, emits output. | Thin. |
+
+**The IO-free invariant on `dispcli-core` is load-bearing.** The eventual
+mnemra plugin frontend is a WebAssembly Component Model module — it
+re-implements the IO adapters via WIT host functions, leaving `dispcli-core`
+untouched. Any `std::fs` / `std::process` / stdin call inside `dispcli-core`
+breaks the WASM port. Use a trait + caller-provided implementation instead.
+
+## Layout conventions
+
+- **No `src/` directories.** Library entrypoints: `libs/{crate}/{crate_name}.rs`.
+  Binary entrypoints: `cmd/{name}/main.rs`.
+- Workspace members listed in the root `Cargo.toml`. Adding a crate means
+  editing that list, creating the directory with `Cargo.toml` + entrypoint,
+  and confirming `[lints] workspace = true` is set on the new member.
+
+## Lint discipline
+
+All clippy lints are declared in `[workspace.lints.clippy]` in the root
+`Cargo.toml`. Every member crate **must** include `[lints] workspace = true`
+or it silently misses the strict set.
+
+Categories enforced (full list in root `Cargo.toml`):
+
+- **Don't panic** — no `unwrap`, `expect`, `panic`, `todo`, `unreachable`
+  in production paths. Test code is exempt via `clippy.toml` carve-outs.
+- **Don't fail silently** — results must be handled or explicitly discarded.
+- **Don't do bad async** — no locks held across `.await`.
+- **Memory safety** — all `unsafe` blocks must be documented.
+- **Suppression discipline** — use `#[expect(..., reason = "…")]`, never
+  bare `#[allow(...)]`. The lint set itself enforces this.
+
+## Build and check
+
+```
+just check     # fmt + clippy + test
+just test      # full test run
+just coverage  # llvm-cov, used by CI
+```
+
+CI runs `just check` and `just coverage`; both must pass.
+
+## Specs drive code
+
+This repo follows spec-first development. `docs/specs/` holds the
+authoritative description of each feature. Don't write implementation that
+isn't covered by a spec — the spec is the agreed surface, and implementers
+get latitude on the *how* but not the *what*.

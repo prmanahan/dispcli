@@ -1,0 +1,17 @@
+[package]
+name    = "dispcli-io"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "dispcli_io"
+path = "./dispcli_io.rs"
+
+[dependencies]
+dispcli-core = { path = "../dispcli-core" }
+anyhow       = { workspace = true }
+
+[lints]
+workspace = true
