@@ -21,17 +21,23 @@ breaks the WASM port. Use a trait + caller-provided implementation instead.
 
 ## Layout conventions
 
-- **No `src/` directories.** Library entrypoints: `libs/{crate}/{crate_name}.rs`.
-  Binary entrypoints: `cmd/{name}/main.rs`.
+- **No `src/` directories.** Workspace layout:
+  - `cmd/{name}/main.rs` — project binaries (the things you ship)
+  - `libs/{crate}/{crate_name}.rs` — project libraries
+  - `tools/{name}/main.rs` — optional location for build-time / dev tools (none present today; convention reserved)
 - Workspace members listed in the root `Cargo.toml`. Adding a crate means
   editing that list, creating the directory with `Cargo.toml` + entrypoint,
-  and confirming `[lints] workspace = true` is set on the new member.
+  and confirming `[lints] workspace = true` is set on the new member (see
+  carve-out for `tools/` below).
 
 ## Lint discipline
 
 All clippy lints are declared in `[workspace.lints.clippy]` in the root
-`Cargo.toml`. Every member crate **must** include `[lints] workspace = true`
-or it silently misses the strict set.
+`Cargo.toml`. Every crate in `cmd/` or `libs/` **must** include
+`[lints] workspace = true` or it silently misses the strict set. Crates in
+`tools/` **may** omit it when their source uses pragmatic patterns that
+don't satisfy the strict set — the omission must be documented with a
+comment in the crate's `Cargo.toml` explaining why.
 
 Categories enforced (full list in root `Cargo.toml`):
 

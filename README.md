@@ -62,11 +62,13 @@ just build
 | `libs/dispcli-core/` | IO-free crate — types, traits, envelope assembly (spec-pending) |
 | `libs/dispcli-io/` | Native IO adapters — filesystem skill resolver, scratch writer (spec-pending) |
 | `docs/specs/` | Spec directory — drives all implementation |
-| `justfile` | Standard recipes: `check`, `fmt`, `test`, `coverage`, `build`, `release` |
+| `docs/src/` | mdBook docs source (`book.toml`, `intro.md`, `adrs/`) |
+| `justfile` | Standard recipes: `check`, `fmt`, `test`, `coverage`, `build`, `release`, `docs`, `docs-serve` |
 | `.cargo/config.toml` | `lld` linker for faster dev builds |
 | `deny.toml` | License policy (Green/Yellow/Red) |
 | `clippy.toml` | Test carve-outs (allow `unwrap`/`panic` in tests) |
 | `.github/workflows/ci.yml` | CI: `just check` + `just coverage` + Codecov upload |
+| `.github/workflows/docs.yml` | Docs deploy to GitHub Pages — **manual trigger only** until Pages is enabled (see workflow file for activation) |
 
 ---
 

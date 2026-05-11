@@ -1,0 +1,65 @@
+name: Docs
+
+on:
+  # Manual trigger only by default. When GitHub Pages is enabled for this
+  # repo (Settings → Pages → Source: Deploy from a branch → gh-pages),
+  # uncomment the `push` block below so docs deploy on every change.
+  #
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - "docs/**"
+  #     - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@900f2210b1d28bbbd0bd22d17926b9e224e8f231
+
+      - name: Lint workflow (actionlint)
+        uses: rhysd/actionlint@011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - name: Install mdbook-d2
+        run: cargo install --locked mdbook-d2
+
+      - name: Install d2 CLI (v0.7.1)
+        run: |
+          curl -fsSL -o d2.tar.gz \
+            https://github.com/terrastruct/d2/releases/download/v0.7.1/d2-v0.7.1-linux-amd64.tar.gz
+          tar -xzf d2.tar.gz
+          sudo mv d2-v0.7.1/bin/d2 /usr/local/bin/d2
+          d2 --version
+
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@ee69d230fe19748b7abf22df32acaa93833fad08 # v2.0.0
+        with:
+          mdbook-version: "0.5.2"
+
+      - name: Install mdbook-mermaid
+        run: cargo install --locked mdbook-mermaid --version 0.17.0
+
+      - name: Build docs
+        run: mdbook build docs/
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs/book
+          publish_branch: gh-pages
