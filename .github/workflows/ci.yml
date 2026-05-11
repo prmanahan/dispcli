@@ -30,7 +30,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -63,7 +63,7 @@ jobs:
             ${{ runner.os }}-cargo-cov-
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
