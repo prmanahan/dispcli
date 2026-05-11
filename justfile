@@ -25,7 +25,7 @@ test:
 # Requires cargo-llvm-cov: `cargo install --locked cargo-llvm-cov`
 coverage:
     cargo llvm-cov --workspace --lcov --output-path lcov.info
-    cargo llvm-cov report --workspace --summary-only
+    cargo llvm-cov report --summary-only
 
 # Build all workspace members in debug mode.
 build:
