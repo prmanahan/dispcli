@@ -5,7 +5,7 @@ language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/prmanahan/dispcli"
+git-repository-url = "https://github.com/mnemra/dispcli"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

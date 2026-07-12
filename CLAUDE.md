@@ -19,6 +19,34 @@ re-implements the IO adapters via WIT host functions, leaving `dispcli-core`
 untouched. Any `std::fs` / `std::process` / stdin call inside `dispcli-core`
 breaks the WASM port. Use a trait + caller-provided implementation instead.
 
+## Repository layout
+
+As-built tree:
+
+```
+cmd/dispcli/            # the binary
+├── main.rs
+└── tests/integration.rs
+libs/dispcli-core/       # IO-free dispatch-envelope logic
+├── dispcli_core.rs
+└── tests/integration.rs
+libs/dispcli-io/         # native IO adapters (implements dispcli-core traits)
+├── dispcli_io.rs
+└── tests/integration.rs
+docs/specs/               # feature specs — README.md + NNNN-slug.md
+docs/src/                 # mdBook source (intro.md, SUMMARY.md, adrs/;
+                           # mermaid + d2 preprocessors)
+Cargo.toml                # workspace manifest
+justfile, clippy.toml, deny.toml, .github/
+```
+
+`docs/specs/` holds the authoritative feature specs; `docs/src/` is the
+mdBook that renders them for contributors.
+
+**Current status:** scaffold + spec-driven. Spec 0001 (envelope assembly)
+defines the first feature; implementation has not started yet — don't go
+looking for code that isn't there.
+
 ## Layout conventions
 
 - **No `src/` directories.** Workspace layout:
