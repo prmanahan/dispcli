@@ -9,10 +9,11 @@ This documentation covers the internal architecture, design decisions, and devel
 This docs site is built with [mdBook](https://rust-lang.github.io/mdBook/) and includes:
 
 - **Architecture Decision Records (ADRs)** — the reasoning behind key design choices
+- **Specifications** — the authoritative feature contracts (what "done" looks like)
 - **Developer guides** — how to build, extend, and contribute
 
 ## Repository
 
-Source code lives at: [https://github.com/prmanahan/dispcli](https://github.com/prmanahan/dispcli)
+Source code lives at: [https://github.com/mnemra/dispcli](https://github.com/mnemra/dispcli)
 
-For a project overview and quick-start instructions, see the [README](https://github.com/prmanahan/dispcli/blob/main/README.md) in the repository root.
+For a project overview and quick-start instructions, see the [README](https://github.com/mnemra/dispcli/blob/main/README.md) in the repository root.
