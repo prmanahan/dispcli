@@ -1,6 +1,9 @@
 # Build output
 /target/
 
+# Docs build output (mdBook)
+/docs/book/
+
 # Coverage
 lcov.info
 
