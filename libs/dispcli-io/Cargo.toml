@@ -13,5 +13,8 @@ path = "./dispcli_io.rs"
 dispcli-core = { path = "../dispcli-core" }
 anyhow       = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

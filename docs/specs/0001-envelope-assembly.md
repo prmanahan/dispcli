@@ -422,6 +422,10 @@ emission, post-dispatch git verification, recipe-existence checking
 against the target project, profile/skill content linting, general
 glob-intersection scope-overlap detection (v0 warns only on
 identical-pattern duplicates — R7), a `skills_root` rooting convention
-(reserved — R2/AC2.5), and the WASM Component Model frontend. The `ContentResolver`/`DocumentSink` traits are
+(reserved — R2/AC2.5), path-resolution subtree confinement (`..`/symlink
+escape blocking via canonicalize-then-verify — deferred under the v0
+trusted-registry trust model per R3; revisit if the registry becomes an
+untrusted / multi-tenant input; surfaced by the Warden Task 3 review
+2026-07-15), and the WASM Component Model frontend. The `ContentResolver`/`DocumentSink` traits are
 the seam the WASM port re-implements; nothing in this spec may assume a
 filesystem beyond `dispcli-io`.
