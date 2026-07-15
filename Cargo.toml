@@ -20,6 +20,10 @@ clap       = { version = "4", features = ["derive"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml       = "0.8"
+# Glob-pattern compilation for R7 touch_scope/forbid_scope validation
+# (spec 0001 Task 6) — green-tier (MIT/Unlicense), no compiled-in glob
+# matching semantics beyond "does this pattern compile".
+globset    = "0.4"
 
 # Test deps
 assert_cmd = "2"

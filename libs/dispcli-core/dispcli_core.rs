@@ -17,9 +17,14 @@
 //! this crate returns. `parse_request`/`parse_registry` now map their
 //! underlying `serde_json`/`toml` parse errors into `Error`
 //! (`RequestInvalid`/`ConfigInvalid`) instead of returning the raw
-//! library error types. No resolver/sink implementations (Task 3) and
-//! no R7 field-path validation (Task 6) land here.
-//! See `docs/specs/0001-envelope-assembly.md`.
+//! library error types.
+//!
+//! Task 6 scope: [`validate_request`] — the R1 AC1.1 + R7 request-side
+//! validation stage, collecting every instance of the first failing
+//! class with a field-path + offending-value [`Error::all_details`] pair
+//! per instance. R2/AC2.1-2.3 registry self-consistency validation
+//! (dangling references, closed `include` enum, resolvable paths) is a
+//! separate, later task's job. See `docs/specs/0001-envelope-assembly.md`.
 
 use std::collections::BTreeMap;
 
@@ -51,10 +56,13 @@ pub enum Tier {
 
 /// Claude Code permission mode for a dispatch. Closed to exactly these
 /// four values (R7) — `"plan"` is a real permission mode elsewhere in the
-/// harness but is deliberately excluded here; rejecting it with the
-/// dedicated "plan mode is not dispatchable" message is R7 validation
-/// logic (a later task), not this type. Here it just needs to fail to
-/// deserialize like any other unrecognized value.
+/// harness but is deliberately excluded here, so it always fails to
+/// deserialize like any other unrecognized value; this type's job is only
+/// to make `"plan"` unrepresentable. The dedicated "plan mode is not
+/// dispatchable" message + structured field/value detail (R7) is produced
+/// one layer up, by [`parse_request`]/[`parse_registry`] re-inspecting the
+/// raw input on a parse failure (Task 6) — see
+/// [`enrich_plan_mode_request_error`]/[`enrich_plan_mode_registry_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
@@ -78,9 +86,10 @@ pub enum Include {
 // ============================================================================
 
 /// A caller-supplied capability/reason pair overriding an agent's command
-/// scope (`command_scope_add` / `command_scope_subtract`, R1). `reason`
-/// being required and non-empty is an R7 validation rule for a later
-/// task; this type only fixes the shape.
+/// scope (`command_scope_add` / `command_scope_subtract`, R1). Both fields
+/// being *non-empty* (not just present) is an R7 rule enforced by
+/// [`validate_request`] (Task 6) — this type only fixes the shape, so an
+/// empty string still parses here and is caught one layer up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeOverride {
@@ -156,10 +165,42 @@ fn default_weight() -> String {
 /// malformed JSON, a missing required field, an unknown top-level or
 /// `envelope` key (`deny_unknown_fields`), or a value outside a closed
 /// enum (`tier`, `mode_override`) — the message is the underlying
-/// `serde_json` error's `Display`. Field-path-aware validation errors
-/// (R7) are a later task.
+/// `serde_json` error's `Display`, except for `mode_override: "plan"`
+/// specifically, which gets the dedicated R7 message + structured
+/// `field`/`value` detail (see [`enrich_plan_mode_request_error`]).
+/// Field-path-aware validation for every other R1/R7 rule is
+/// [`validate_request`] (Task 6) — this function only covers what
+/// `serde_json`'s own parse enforces.
 pub fn parse_request(input: &str) -> Result<DispatchRequest, Error> {
-    serde_json::from_str(input).map_err(Error::from)
+    serde_json::from_str(input).map_err(|err| enrich_plan_mode_request_error(input, err))
+}
+
+/// On a request-parse failure, re-inspects the raw JSON for
+/// `mode_override == "plan"` (R7: `plan` is rejected with a dedicated
+/// "plan mode is not dispatchable" message + field/value detail).
+/// `mode_override` is typed `Option<PermissionMode>` — a closed 4-variant
+/// enum with no `Plan` variant (deliberately; see [`PermissionMode`]'s doc
+/// comment) — so `"plan"` can never survive into a live [`DispatchRequest`]
+/// for [`validate_request`] to inspect post-parse. This function is the
+/// only point in the pipeline that still has the raw offending string,
+/// which is why the dedicated message is produced here rather than in
+/// `validate_request`. Any other parse failure (including a request where
+/// `mode_override` legitimately isn't `"plan"`) falls through to the
+/// standard `serde_json`-message mapping, unchanged.
+fn enrich_plan_mode_request_error(input: &str, err: serde_json::Error) -> Error {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input)
+        && value
+            .get("mode_override")
+            .and_then(serde_json::Value::as_str)
+            == Some("plan")
+    {
+        return class_error(
+            ErrorKind::RequestInvalid,
+            "plan mode is not dispatchable",
+            vec![("mode_override".to_string(), "plan".to_string())],
+        );
+    }
+    Error::from(err)
 }
 
 // ============================================================================
@@ -258,9 +299,41 @@ pub struct Registry {
 /// Returns a [`ConfigInvalid`](ErrorKind::ConfigInvalid) [`Error`] on
 /// malformed TOML, a missing required field, or a value outside a
 /// closed enum (`default_mode`, `include`) — the message is the
-/// underlying `toml` error's `Display`.
+/// underlying `toml` error's `Display`, except for `default_mode = "plan"`
+/// specifically, which gets the dedicated R7 message + structured
+/// `field`/`value` details (see [`enrich_plan_mode_registry_error`]).
 pub fn parse_registry(input: &str) -> Result<Registry, Error> {
-    toml::from_str(input).map_err(Error::from)
+    toml::from_str(input).map_err(|err| enrich_plan_mode_registry_error(input, err))
+}
+
+/// On a registry-parse failure, re-inspects the raw TOML for any
+/// `[agents.<id>]` table with `default_mode = "plan"` — same rationale as
+/// [`enrich_plan_mode_request_error`] (`default_mode` is the same closed
+/// [`PermissionMode`] enum, so `"plan"` can never survive into a live
+/// [`AgentEntry`]). Collects **every** offending agent id (R7's
+/// collect-all-in-class rule), field path `agents.<id>.default_mode`.
+/// Any other parse failure, or a registry where no agent's `default_mode`
+/// is `"plan"`, falls through to the standard mapping unchanged.
+fn enrich_plan_mode_registry_error(input: &str, err: toml::de::Error) -> Error {
+    if let Ok(value) = input.parse::<toml::Value>()
+        && let Some(agents) = value.get("agents").and_then(toml::Value::as_table)
+    {
+        let offenders: Vec<(String, String)> = agents
+            .iter()
+            .filter(|(_, agent)| {
+                agent.get("default_mode").and_then(toml::Value::as_str) == Some("plan")
+            })
+            .map(|(id, _)| (format!("agents.{id}.default_mode"), "plan".to_string()))
+            .collect();
+        if !offenders.is_empty() {
+            return class_error(
+                ErrorKind::ConfigInvalid,
+                "plan mode is not dispatchable",
+                offenders,
+            );
+        }
+    }
+    Error::from(err)
 }
 
 // ============================================================================
@@ -352,6 +425,17 @@ impl Detail {
 /// `{"error": {"kind", "message", "details": [...]}}` stderr payload.
 /// This is the sole error currency the crate returns on any production
 /// path — no panics (AC8.4).
+///
+/// `message` is **display-only** — its exact wording is not a contract
+/// and is not guaranteed stable across call sites that reject the same
+/// underlying condition. E.g. [`validate_request`]'s AC1.1 rejection
+/// ("request references one or more unknown registry ids") and
+/// `resolve_profile`'s defense-in-depth copy of that same rejection
+/// ("unknown agent '{id}'") word it differently while agreeing on `kind`
+/// (`request_invalid`) and the `field`/`value` `details` pair. The
+/// machine-readable contract a caller matches on is `kind` +
+/// [`Error::detail`]/[`Error::all_details`] — never `message`. Divergent
+/// wording between call sites is intentional, not a bug to reconcile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
     pub kind: ErrorKind,
@@ -384,6 +468,23 @@ impl Error {
             .iter()
             .find(|d| d.key == key)
             .map(|d| d.value.as_str())
+    }
+
+    /// Every value recorded under `key`, in append order — the
+    /// multi-instance counterpart to [`Error::detail`] (which returns only
+    /// the first match). [`validate_request`]'s collect-all-in-class
+    /// output (R7 preamble, AC7.2 — "first failure class reported with
+    /// every instance of that class") repeats `"field"`/`"value"` detail
+    /// pairs, one pair per violating instance; pair up `all_details("field")`
+    /// and `all_details("value")` by position to recover every instance,
+    /// not just the first.
+    #[must_use]
+    pub fn all_details(&self, key: &str) -> Vec<&str> {
+        self.details
+            .iter()
+            .filter(|d| d.key == key)
+            .map(|d| d.value.as_str())
+            .collect()
     }
 
     /// Build a `resolution_failed` error carrying the registry `id`,
@@ -419,8 +520,14 @@ impl std::error::Error for Error {}
 
 impl From<serde_json::Error> for Error {
     /// Maps a request-parse failure into `request_invalid` (R1/AC1.1
-    /// territory). The message is the raw `serde_json` `Display`; no
-    /// field-path extraction — that's R7 validation (Task 6).
+    /// territory). The message is the raw `serde_json` `Display` — no
+    /// structured field-path detail; that's [`validate_request`]'s job
+    /// (Task 6) for the rules it covers, applied to an already-parsed
+    /// request. This is strictly the fallback for shape/type failures
+    /// `serde_json` itself catches during parsing (missing field, wrong
+    /// type, unknown key) — [`parse_request`] special-cases exactly one
+    /// of those (`mode_override: "plan"`) ahead of this mapping; see
+    /// [`enrich_plan_mode_request_error`].
     fn from(err: serde_json::Error) -> Self {
         Error::new(ErrorKind::RequestInvalid, err.to_string())
     }
@@ -513,6 +620,10 @@ impl Envelope {
     /// `envelope.report_path` is null, it defaults to
     /// `{worktree or repo}/scratch/dispatch-{dispatch_id}-report.md`
     /// (AC4.2) — worktree takes precedence over repo when present.
+    /// `touch_scope`/`forbid_scope` entries get the R7 trailing-slash
+    /// normalization (`path/` -> `path/**`) unconditionally, so the
+    /// normalization is observable in the emitted envelope regardless of
+    /// whether [`validate_request`] ran first (AC7.3).
     #[must_use]
     pub fn from_request(request: &DispatchRequest) -> Self {
         let env = &request.envelope;
@@ -537,8 +648,16 @@ impl Envelope {
             deadline_minutes: env.deadline_minutes,
             command_scope_subtract: env.command_scope_subtract.clone(),
             command_scope_add: env.command_scope_add.clone(),
-            touch_scope: env.touch_scope.clone(),
-            forbid_scope: env.forbid_scope.clone(),
+            touch_scope: env
+                .touch_scope
+                .iter()
+                .map(|p| normalize_scope_glob(p))
+                .collect(),
+            forbid_scope: env
+                .forbid_scope
+                .iter()
+                .map(|p| normalize_scope_glob(p))
+                .collect(),
             verify: env.verify.clone(),
         }
     }
@@ -736,6 +855,332 @@ fn yaml_scope_override_array(items: &[ScopeOverride]) -> String {
 }
 
 // ============================================================================
+// R1 + R7 — Request-side validation (Task 6)
+//
+// `validate_request` is the request-side validation stage the spec's
+// pipeline diagram calls `[validate]` — it runs against an already-parsed
+// `DispatchRequest`/`Registry` pair, before `assemble_standard` (R5) is
+// ever called. Wiring it into `cmd/dispcli`'s pipeline ahead of
+// `assemble_standard` is a later task's job (this crate exposes the
+// function; it does not call itself, and never writes any output — "no
+// partial output on failure" (AC1.1) falls out of the caller only
+// proceeding on `Ok`). R2/AC2.1-2.3 registry self-consistency checks
+// (dangling references, closed `include` enum, resolvable paths) are
+// Task 7's job — this function only validates a request AGAINST a given
+// registry's already-declared ids.
+//
+// Two R7 rules — the mode-value and tier-value closed enums — are
+// enforced entirely at parse time, not here: `PermissionMode`/`Tier` are
+// already closed enums (Task 1), so an invalid value (e.g. `"plan"`) can
+// never survive into a live `DispatchRequest`/`AgentEntry` for this
+// function to inspect — "define errors out of existence" (the type makes
+// the invalid state unrepresentable; skills/rust.md `<design-heuristics>`).
+// The dedicated "plan mode is not dispatchable" message and its
+// structured field/value detail are produced by `parse_request`/
+// `parse_registry` re-inspecting the raw input on a parse failure — see
+// `enrich_plan_mode_request_error`/`enrich_plan_mode_registry_error` above.
+// ============================================================================
+
+/// True when `s` is exactly 40 lowercase hex characters (R7:
+/// `parent_commit` / `spec_version` when non-null). Deliberately exact —
+/// a 39- or 41-char value, or any uppercase hex digit, is rejected: "40
+/// lower-hex" is not case-insensitive or length-tolerant.
+fn is_valid_sha40(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// True when `s` is an absolute path (R7: `repo` / `worktree` /
+/// `report_path` when non-null). Pure syntactic check — `Path::is_absolute`
+/// touches no filesystem, so this stays within the crate's IO-free
+/// invariant (AC3.1).
+fn is_absolute_path(s: &str) -> bool {
+    std::path::Path::new(s).is_absolute()
+}
+
+/// R7 trailing-slash scope-glob normalization: `path/` becomes `path/**`;
+/// anything else passes through unchanged. Shared by [`validate_request`]
+/// (validates that the *normalized* form compiles as a glob) and
+/// [`Envelope::from_request`] (AC7.3 — the normalization must be
+/// observable in the emitted envelope, not merely accepted by validation).
+fn normalize_scope_glob(pattern: &str) -> String {
+    match pattern.strip_suffix('/') {
+        Some(prefix) => format!("{prefix}/**"),
+        None => pattern.to_string(),
+    }
+}
+
+/// Shell metacharacters a `verify` entry may not contain (R7) — checked
+/// after `just `-prefix stripping, before the whitespace split.
+const VERIFY_SHELL_METACHARACTERS: [char; 11] =
+    ['&', '|', ';', '>', '<', '`', '$', '(', ')', '\n', '\r'];
+
+/// One parsed `verify` entry (R7): the recipe name plus any trailing args.
+/// Not yet wired into [`Summary`]'s `verify_recipes` — that wiring is a
+/// later task's job; this is the parsing seam it will call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedVerifyEntry {
+    pub recipe: String,
+    pub args: Vec<String>,
+}
+
+/// Parses one `verify` entry (R7): trims whitespace, strips a leading
+/// `just ` token, rejects an empty result, rejects any entry containing a
+/// [`VERIFY_SHELL_METACHARACTERS`] character, then whitespace-splits into
+/// recipe + args — `"just check"` and `"check"` both parse to recipe
+/// `"check"`. dispcli does not confirm the recipe exists (R7) — that
+/// requires running the target project's tooling.
+///
+/// # Errors
+/// A human-readable reason (empty-after-trim, or the metacharacter
+/// rejection) — [`validate_request`] is the caller that wraps this into a
+/// field-path-aware `request_invalid` [`Error`]; this function stays a
+/// pure parser with no `Error` dependency of its own.
+pub fn parse_verify_entry(raw: &str) -> Result<ParsedVerifyEntry, String> {
+    let trimmed = raw.trim();
+    let stripped = match trimmed.strip_prefix("just ") {
+        Some(rest) => rest.trim_start(),
+        None => trimmed,
+    };
+    if stripped.is_empty() {
+        return Err(format!("verify entry '{raw}' is empty after trimming"));
+    }
+    if stripped
+        .chars()
+        .any(|c| VERIFY_SHELL_METACHARACTERS.contains(&c))
+    {
+        return Err(format!(
+            "verify entry '{raw}' contains a disallowed shell metacharacter"
+        ));
+    }
+    let mut parts = stripped.split_whitespace();
+    let recipe = match parts.next() {
+        Some(r) => r.to_string(),
+        // Unreachable: `stripped` is non-empty (checked above), so
+        // `split_whitespace` always yields at least one item. Matched
+        // explicitly (rather than `.next().expect(...)`) to stay
+        // unwrap/expect-free per the workspace no-panic lint set.
+        None => return Err(format!("verify entry '{raw}' is empty after trimming")),
+    };
+    Ok(ParsedVerifyEntry {
+        recipe,
+        args: parts.map(str::to_string).collect(),
+    })
+}
+
+/// Gap-3 (resolved 2026-07-15) — **tractable reading only, v0**: returns
+/// one warning per normalized glob string present in *both* `touch_scope`
+/// and `forbid_scope` (literal-duplicate detection after R7 trailing-slash
+/// normalization). This is deliberately NOT general glob-intersection over
+/// differing patterns (e.g. `libs/**` vs `libs/foo.rs` would NOT warn
+/// here) — that is explicitly deferred to v1+ (spec Deferred section).
+/// The overlap-warning *behavior itself* is marked **pending** the spec
+/// author's ruling on literal-dup vs true glob-intersection — do not
+/// extend this function toward intersection matching.
+#[must_use]
+pub fn scope_overlap_warnings(touch_scope: &[String], forbid_scope: &[String]) -> Vec<String> {
+    let normalized_touch: std::collections::BTreeSet<String> = touch_scope
+        .iter()
+        .map(|p| normalize_scope_glob(p))
+        .collect();
+    forbid_scope
+        .iter()
+        .map(|p| normalize_scope_glob(p))
+        .filter(|p| normalized_touch.contains(p))
+        .map(|p| {
+            format!(
+                "scope pattern '{p}' appears in both touch_scope and forbid_scope \
+                 (forbid wins downstream)"
+            )
+        })
+        .collect()
+}
+
+/// Builds an [`Error`] of `kind` reporting every instance of one failing
+/// validation class (R7 preamble / AC7.2: "first failure class reported
+/// with every instance of that class"). Each `(field_path,
+/// offending_value)` pair becomes a `"field"`/`"value"` detail pair, in
+/// order — recover all of them via [`Error::all_details`], not just the
+/// first (that's what [`Error::detail`] would give you).
+fn class_error(
+    kind: ErrorKind,
+    message: impl Into<String>,
+    instances: Vec<(String, String)>,
+) -> Error {
+    let mut err = Error::new(kind, message);
+    for (field, value) in instances {
+        err = err.with_detail("field", field).with_detail("value", value);
+    }
+    err
+}
+
+/// Validates `request` against `registry` (R1 AC1.1 unknown-id checks +
+/// every R7 request-side rule). Runs each validation class in the order
+/// below, returning the **first** class with any violation — but
+/// reporting **every instance** within that class (R7's no-fail-fast-
+/// within-a-class rule, AC7.2). A caller re-runs this after fixing the
+/// reported class to discover the next one; it does not attempt to
+/// surface every class in a single call.
+///
+/// Two R7 rules are deliberately absent from this function's body: the
+/// mode-value and tier-value closed enums are enforced by the type system
+/// at parse time (see the module-level note above this section) — there
+/// is nothing left for this function to check for those two rules.
+///
+/// # Errors
+/// A `request_invalid` [`Error`] from the first failing class, carrying
+/// one `"field"`/`"value"` detail pair per violating instance
+/// (recoverable via [`Error::all_details`]).
+pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Result<(), Error> {
+    // R1 AC1.1 — unknown agent / task_pattern / weight / skill id.
+    let mut unknown_ids = Vec::new();
+    if !registry.agents.contains_key(&request.agent) {
+        unknown_ids.push(("agent".to_string(), request.agent.clone()));
+    }
+    if !registry.patterns.contains_key(&request.task_pattern) {
+        unknown_ids.push(("task_pattern".to_string(), request.task_pattern.clone()));
+    }
+    if !registry.weights.contains_key(&request.weight) {
+        unknown_ids.push(("weight".to_string(), request.weight.clone()));
+    }
+    for (i, skill_id) in request.skills_add.iter().enumerate() {
+        if !registry.skills.contains_key(skill_id) {
+            unknown_ids.push((format!("skills_add[{i}]"), skill_id.clone()));
+        }
+    }
+    for (i, skill_id) in request.skills_remove.iter().enumerate() {
+        if !registry.skills.contains_key(skill_id) {
+            unknown_ids.push((format!("skills_remove[{i}]"), skill_id.clone()));
+        }
+    }
+    if !unknown_ids.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "request references one or more unknown registry ids",
+            unknown_ids,
+        ));
+    }
+
+    // R7 — parent_commit / spec_version: 40-char lower-hex when non-null.
+    let env = &request.envelope;
+    let mut bad_shas = Vec::new();
+    if !is_valid_sha40(&env.parent_commit) {
+        bad_shas.push((
+            "envelope.parent_commit".to_string(),
+            env.parent_commit.clone(),
+        ));
+    }
+    if let Some(spec_version) = &env.spec_version
+        && !is_valid_sha40(spec_version)
+    {
+        bad_shas.push(("envelope.spec_version".to_string(), spec_version.clone()));
+    }
+    if !bad_shas.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "parent_commit/spec_version must be 40-char lowercase hex",
+            bad_shas,
+        ));
+    }
+
+    // R7 — repo / worktree / report_path: absolute when non-null. Checked
+    // on the raw request fields (an `Option` left `None` is skipped, never
+    // defaulted first) — the *defaulted* `Envelope.report_path` is always
+    // absolute whenever `repo` is, which would make this rule untestable.
+    let mut bad_paths = Vec::new();
+    if !is_absolute_path(&env.repo) {
+        bad_paths.push(("envelope.repo".to_string(), env.repo.clone()));
+    }
+    if let Some(worktree) = &env.worktree
+        && !is_absolute_path(worktree)
+    {
+        bad_paths.push(("envelope.worktree".to_string(), worktree.clone()));
+    }
+    if let Some(report_path) = &env.report_path
+        && !is_absolute_path(report_path)
+    {
+        bad_paths.push(("envelope.report_path".to_string(), report_path.clone()));
+    }
+    if !bad_paths.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "repo/worktree/report_path must be absolute paths",
+            bad_paths,
+        ));
+    }
+
+    // R7 — verify entries: each entry must parse per `parse_verify_entry`.
+    let mut bad_verify = Vec::new();
+    for (i, entry) in env.verify.iter().enumerate() {
+        if parse_verify_entry(entry).is_err() {
+            bad_verify.push((format!("envelope.verify[{i}]"), entry.clone()));
+        }
+    }
+    if !bad_verify.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "one or more verify entries failed to parse",
+            bad_verify,
+        ));
+    }
+
+    // R7 — command_scope_subtract / command_scope_add: capability + reason
+    // both required and non-empty. One combined class across both arrays
+    // (a bad entry in either reports alongside the other).
+    let mut bad_overrides = Vec::new();
+    for (list_name, overrides) in [
+        ("command_scope_subtract", &env.command_scope_subtract),
+        ("command_scope_add", &env.command_scope_add),
+    ] {
+        for (i, entry) in overrides.iter().enumerate() {
+            if entry.capability.trim().is_empty() {
+                bad_overrides.push((
+                    format!("envelope.{list_name}[{i}].capability"),
+                    entry.capability.clone(),
+                ));
+            }
+            if entry.reason.trim().is_empty() {
+                bad_overrides.push((
+                    format!("envelope.{list_name}[{i}].reason"),
+                    entry.reason.clone(),
+                ));
+            }
+        }
+    }
+    if !bad_overrides.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "one or more command_scope entries are missing capability or reason",
+            bad_overrides,
+        ));
+    }
+
+    // R7 — touch_scope / forbid_scope: each entry compiles as a glob (the
+    // *normalized* form — AC7.3 trailing-slash normalization). One
+    // combined class across both arrays.
+    let mut bad_globs = Vec::new();
+    for (list_name, patterns) in [
+        ("touch_scope", &env.touch_scope),
+        ("forbid_scope", &env.forbid_scope),
+    ] {
+        for (i, pattern) in patterns.iter().enumerate() {
+            let normalized = normalize_scope_glob(pattern);
+            if globset::Glob::new(&normalized).is_err() {
+                bad_globs.push((format!("envelope.{list_name}[{i}]"), pattern.clone()));
+            }
+        }
+    }
+    if !bad_globs.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "one or more touch_scope/forbid_scope entries do not compile as a glob",
+            bad_globs,
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // R8 — Output contract: summary
 // ============================================================================
 
@@ -863,10 +1308,12 @@ fn join_sections(sections: Vec<Section>) -> AssembledDocument {
 }
 
 /// Resolves the agent's profile content (R5 step 1). Returns
-/// `request_invalid` when `agent_id` has no registry entry — this
-/// previews the AC1.1 "unknown agent" rejection Task 6 formalizes with
-/// field-path detail; here it only guarantees assembly fails loudly
-/// rather than panicking on a fixture Task 6 hasn't validated yet.
+/// `request_invalid` when `agent_id` has no registry entry — the same
+/// AC1.1 "unknown agent" rejection [`validate_request`] (Task 6) reports
+/// earlier in the pipeline, with the same `field`/`value` detail shape.
+/// This defense-in-depth copy guarantees assembly still fails loudly
+/// (rather than panicking) when `assemble_standard` is called directly,
+/// without `validate_request` having run first.
 fn resolve_profile(
     agent_id: &str,
     registry: &Registry,
@@ -994,10 +1441,12 @@ fn substitute_placeholders(
 ///
 /// # Errors
 /// A [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] for an
-/// unknown `agent` or `task_pattern` (previews AC1.1 — full field-path
-/// validation is Task 6); a [`ConfigInvalid`](ErrorKind::ConfigInvalid)
-/// [`Error`] for a dangling registry reference (AC2.2 — full registry
-/// validation is Task 7); whatever `resolver.resolve` returns
+/// unknown `agent` or `task_pattern` (AC1.1 — same rejection
+/// [`validate_request`] (Task 6) reports earlier in the pipeline, with
+/// the same field/value detail shape); a
+/// [`ConfigInvalid`](ErrorKind::ConfigInvalid) [`Error`] for a dangling
+/// registry reference (AC2.2 — full registry self-consistency validation
+/// is a separate, later task); whatever `resolver.resolve` returns
 /// (typically [`ResolutionFailed`](ErrorKind::ResolutionFailed), AC3.3)
 /// on a content-resolution failure.
 pub fn assemble_standard(

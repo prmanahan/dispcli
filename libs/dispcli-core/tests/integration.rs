@@ -11,10 +11,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use dispcli_core::{
-    AgentEntry, BlockEntry, BlocksSection, ContentResolver, DispatchRequest, DocumentSink,
-    Envelope, EnvelopeRequest, Error, ErrorKind, Include, PatternEntry, PermissionMode, Registry,
-    RegistryMeta, ScopeOverride, SkillEntry, Tier, assemble_standard, parse_registry,
-    parse_request,
+    AgentEntry, AllOrList, BlockEntry, BlocksSection, ContentResolver, DispatchRequest,
+    DocumentSink, Envelope, EnvelopeRequest, Error, ErrorKind, Include, PatternEntry,
+    PermissionMode, Registry, RegistryMeta, ScopeOverride, SkillEntry, Tier, WeightClass,
+    assemble_standard, parse_registry, parse_request, parse_verify_entry, scope_overlap_warnings,
+    validate_request,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -503,6 +504,20 @@ fn sample_registry() -> Registry {
         },
     );
 
+    // Task 6 — `validate_request`'s unknown-weight check (AC1.1) needs
+    // "standard" declared, since `sample_request()` defaults to it; the
+    // weight-class *content* is irrelevant to every other test using this
+    // fixture (Task 4's `assemble_standard` never consults `weights`).
+    let mut weights = BTreeMap::new();
+    weights.insert(
+        "standard".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: None,
+            blocks: AllOrList::All("all".to_string()),
+        },
+    );
+
     Registry {
         registry: RegistryMeta {
             skills_root: "skills".to_string(),
@@ -518,7 +533,7 @@ fn sample_registry() -> Registry {
             ],
             blocks,
         },
-        weights: BTreeMap::new(),
+        weights,
     }
 }
 
@@ -1096,5 +1111,574 @@ fn envelope_scalar_with_embedded_newline_renders_quoted_and_preserves_line_struc
         ordinary_lines,
         "an embedded control character rendered bare would insert an \
          extra line, corrupting the envelope's fixed field-order schema"
+    );
+}
+
+// ============================================================================
+// Task 6 — R1 AC1.1 + R7 request-side validation (`validate_request`,
+// `parse_verify_entry`, `scope_overlap_warnings`, plan-mode enrichment on
+// `parse_request`/`parse_registry`).
+// ============================================================================
+
+// ---- R1 AC1.1 — unknown agent / task_pattern / weight / skill id --------
+
+#[test]
+fn validate_request_accepts_known_agent_pattern_weight_and_skills() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.skills_add = vec!["rust".to_string()];
+    request.skills_remove = vec!["verify".to_string()];
+    validate_request(&request, &registry).expect("known ids should validate");
+}
+
+#[test]
+fn validate_request_rejects_unknown_agent_with_field_and_value() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.agent = "ghost".to_string();
+    let err = validate_request(&request, &registry).expect_err("unknown agent should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("agent"));
+    assert_eq!(err.detail("value"), Some("ghost"));
+}
+
+#[test]
+fn validate_request_rejects_unknown_task_pattern_with_field_and_value() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.task_pattern = "ghost-pattern".to_string();
+    let err =
+        validate_request(&request, &registry).expect_err("unknown task_pattern should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("task_pattern"));
+    assert_eq!(err.detail("value"), Some("ghost-pattern"));
+}
+
+#[test]
+fn validate_request_rejects_unknown_weight_with_field_and_value() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.weight = "ghost-weight".to_string();
+    let err = validate_request(&request, &registry).expect_err("unknown weight should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("weight"));
+    assert_eq!(err.detail("value"), Some("ghost-weight"));
+}
+
+#[test]
+fn validate_request_rejects_unknown_skill_ids_in_skills_add_and_remove_together() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.skills_add = vec!["ghost-add".to_string()];
+    request.skills_remove = vec!["ghost-remove".to_string()];
+    let err =
+        validate_request(&request, &registry).expect_err("unknown skill ids should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(
+        err.all_details("field"),
+        vec!["skills_add[0]", "skills_remove[0]"],
+        "both unknown skill ids should be reported together (collect-all-in-class)"
+    );
+    assert_eq!(err.all_details("value"), vec!["ghost-add", "ghost-remove"]);
+}
+
+#[test]
+fn validate_request_reports_only_the_first_failing_class_when_multiple_classes_are_invalid() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.agent = "ghost".to_string(); // unknown-id class — checked first.
+    request.envelope.parent_commit = "too-short".to_string(); // SHA class — checked second.
+    let err =
+        validate_request(&request, &registry).expect_err("request should fail on unknown agent");
+    assert_eq!(
+        err.detail("field"),
+        Some("agent"),
+        "the unknown-id class is checked before the SHA class; only its \
+         violation should surface in this call"
+    );
+}
+
+// ---- R7 — parent_commit / spec_version: 40-char lower-hex ---------------
+
+const VALID_SHA: &str = "e2aca810f3f5a11c880beb555bf3ac0be2466e17";
+
+#[test]
+fn validate_request_accepts_40_char_lowercase_sha_in_parent_commit_and_spec_version() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.spec_version = Some(VALID_SHA.to_string());
+    validate_request(&request, &registry).expect("40-char lowercase hex should validate");
+}
+
+#[test]
+fn validate_request_rejects_39_char_parent_commit() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    let short = VALID_SHA
+        .get(..39)
+        .expect("VALID_SHA has at least 39 bytes");
+    request.envelope.parent_commit = short.to_string();
+    let err = validate_request(&request, &registry).expect_err("39-char SHA should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.parent_commit"));
+    assert_eq!(err.detail("value"), Some(short));
+}
+
+#[test]
+fn validate_request_rejects_41_char_parent_commit() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    let long = format!("{VALID_SHA}0");
+    request.envelope.parent_commit = long.clone();
+    let err = validate_request(&request, &registry).expect_err("41-char SHA should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.parent_commit"));
+    assert_eq!(err.detail("value"), Some(long.as_str()));
+}
+
+#[test]
+fn validate_request_rejects_uppercase_hex_sha() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.parent_commit = VALID_SHA.to_ascii_uppercase();
+    let err =
+        validate_request(&request, &registry).expect_err("uppercase hex SHA should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.parent_commit"));
+}
+
+#[test]
+fn validate_request_rejects_bad_spec_version_alongside_valid_parent_commit() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.spec_version = Some("short".to_string());
+    let err =
+        validate_request(&request, &registry).expect_err("bad spec_version should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.spec_version"));
+    assert_eq!(err.detail("value"), Some("short"));
+}
+
+// ---- R7 — repo / worktree / report_path: absolute when non-null ---------
+
+#[test]
+fn validate_request_accepts_absolute_repo_worktree_and_report_path() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.worktree = Some("/abs/path/to/worktree".to_string());
+    request.envelope.report_path = Some("/abs/path/to/report.md".to_string());
+    validate_request(&request, &registry).expect("absolute paths should validate");
+}
+
+#[test]
+fn validate_request_rejects_relative_repo_path() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.repo = "relative/path".to_string();
+    let err =
+        validate_request(&request, &registry).expect_err("relative repo path should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.repo"));
+    assert_eq!(err.detail("value"), Some("relative/path"));
+}
+
+#[test]
+fn validate_request_rejects_relative_worktree_and_report_path_together() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.worktree = Some("relative/worktree".to_string());
+    request.envelope.report_path = Some("relative/report.md".to_string());
+    let err = validate_request(&request, &registry).expect_err("relative paths should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(
+        err.all_details("field"),
+        vec!["envelope.worktree", "envelope.report_path"],
+        "both relative-path violations must be reported together"
+    );
+    assert_eq!(
+        err.all_details("value"),
+        vec!["relative/worktree", "relative/report.md"]
+    );
+}
+
+// ---- R7 — verify entries --------------------------------------------------
+
+#[test]
+fn parse_verify_entry_strips_just_prefix_to_same_recipe_as_bare_form() {
+    let with_prefix = parse_verify_entry("just check").expect("should parse");
+    let bare = parse_verify_entry("check").expect("should parse");
+    assert_eq!(with_prefix.recipe, "check");
+    assert_eq!(bare.recipe, "check");
+    assert!(with_prefix.args.is_empty());
+    assert!(bare.args.is_empty());
+}
+
+#[test]
+fn parse_verify_entry_accepts_recipe_with_args() {
+    let parsed = parse_verify_entry("check --release").expect("should parse");
+    assert_eq!(parsed.recipe, "check");
+    assert_eq!(parsed.args, vec!["--release".to_string()]);
+}
+
+#[test]
+fn parse_verify_entry_rejects_empty_after_trim() {
+    let err = parse_verify_entry("   ").expect_err("blank entry should be rejected");
+    assert!(err.contains("empty"), "error should say 'empty': {err}");
+
+    let err_empty = parse_verify_entry("").expect_err("empty string should be rejected");
+    assert!(
+        err_empty.contains("empty"),
+        "error should say 'empty': {err_empty}"
+    );
+}
+
+#[test]
+fn parse_verify_entry_treats_bare_just_with_no_trailing_content_as_a_literal_recipe_name() {
+    // Rule order is "trim; THEN strip a leading `just ` token" — trimming
+    // "just " (trailing space, nothing after) already consumes the space
+    // the prefix match needs, so the literal 4-char token "just" no
+    // longer matches the 5-char prefix "just " and is treated as a
+    // (nonsensical but well-formed) recipe name in its own right. This is
+    // the deliberate consequence of applying the R7 rule steps in the
+    // order given, not a special case carved out for it.
+    let parsed = parse_verify_entry("just ").expect("bare 'just' should parse as a recipe name");
+    assert_eq!(parsed.recipe, "just");
+    assert!(parsed.args.is_empty());
+}
+
+#[test]
+fn parse_verify_entry_rejects_shell_metacharacters() {
+    let err =
+        parse_verify_entry("check; rm -rf /").expect_err("metacharacter entry should be rejected");
+    assert!(
+        err.contains("metacharacter"),
+        "error should name the metacharacter rejection: {err}"
+    );
+}
+
+#[test]
+fn parse_verify_entry_rejects_every_shell_metacharacter() {
+    // Regression lock for `VERIFY_SHELL_METACHARACTERS` (11 entries,
+    // dispcli_core.rs). `parse_verify_entry_rejects_shell_metacharacters`
+    // above only exercises `;` and `&` — this table drives all 11
+    // independently, so silently dropping any single char from the
+    // denylist array makes this test fail. Table literal, not a re-import
+    // of the private const: integration tests only see the public
+    // surface, so this list is the regression oracle, not a mirror.
+    let metacharacters = ['&', '|', ';', '>', '<', '`', '$', '(', ')', '\n', '\r'];
+    assert_eq!(
+        metacharacters.len(),
+        11,
+        "this table must track all 11 VERIFY_SHELL_METACHARACTERS entries"
+    );
+    for c in metacharacters {
+        // Embed the char mid-string (not at either end) so `trim()` never
+        // strips it before the metacharacter scan runs — load-bearing for
+        // '\n'/'\r', which `trim()` would otherwise remove at a boundary.
+        let entry = format!("check{c}rm -rf /");
+        let err = match parse_verify_entry(&entry) {
+            Err(e) => e,
+            Ok(parsed) => panic!("entry containing {c:?} should be rejected, got {parsed:?}"),
+        };
+        assert!(
+            err.contains("metacharacter"),
+            "error for {c:?} should name the metacharacter rejection: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_request_accepts_verify_entries_just_check_and_bare_check() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.verify = vec!["just check".to_string(), "check".to_string()];
+    validate_request(&request, &registry).expect("'just check' and 'check' should both validate");
+}
+
+#[test]
+fn validate_request_collects_all_bad_verify_entries() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.verify = vec![
+        "check".to_string(),            // good
+        "check; rm -rf /".to_string(),  // bad — metacharacter
+        "   ".to_string(),              // bad — empty after trim
+        "check && echo hi".to_string(), // bad — metacharacter
+    ];
+    let err = validate_request(&request, &registry)
+        .expect_err("a request with three bad verify entries should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(
+        err.all_details("field"),
+        vec![
+            "envelope.verify[1]",
+            "envelope.verify[2]",
+            "envelope.verify[3]"
+        ],
+        "all three bad verify entries must be reported together, not just the first"
+    );
+    assert_eq!(
+        err.all_details("value"),
+        vec!["check; rm -rf /", "   ", "check && echo hi"]
+    );
+}
+
+// ---- R7 — command_scope_subtract / command_scope_add ---------------------
+
+#[test]
+fn validate_request_accepts_scope_override_with_capability_and_reason() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.command_scope_subtract = vec![ScopeOverride {
+        capability: "push".to_string(),
+        reason: "no direct push".to_string(),
+    }];
+    validate_request(&request, &registry).expect("non-empty capability + reason should validate");
+}
+
+#[test]
+fn validate_request_rejects_scope_override_missing_reason() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.command_scope_subtract = vec![ScopeOverride {
+        capability: "push".to_string(),
+        reason: String::new(),
+    }];
+    let err = validate_request(&request, &registry).expect_err("empty reason should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(
+        err.detail("field"),
+        Some("envelope.command_scope_subtract[0].reason")
+    );
+    assert_eq!(err.detail("value"), Some(""));
+}
+
+#[test]
+fn validate_request_rejects_scope_override_missing_capability() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.command_scope_add = vec![ScopeOverride {
+        capability: "   ".to_string(),
+        reason: "container build needed".to_string(),
+    }];
+    let err =
+        validate_request(&request, &registry).expect_err("blank capability should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(
+        err.detail("field"),
+        Some("envelope.command_scope_add[0].capability")
+    );
+}
+
+// ---- R7 — scope globs + AC7.3 trailing-slash normalization ---------------
+
+#[test]
+fn validate_request_accepts_compilable_glob_patterns() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.touch_scope = vec!["libs/dispcli-core/**".to_string()];
+    request.envelope.forbid_scope = vec!["Cargo.toml".to_string()];
+    validate_request(&request, &registry).expect("compilable globs should validate");
+}
+
+#[test]
+fn validate_request_rejects_uncompilable_glob_pattern() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    // An unclosed character class does not compile as a glob.
+    request.envelope.touch_scope = vec!["libs/[a-".to_string()];
+    let err = validate_request(&request, &registry).expect_err("malformed glob should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("envelope.touch_scope[0]"));
+}
+
+#[test]
+fn validate_request_accepts_normalized_form_of_trailing_slash_glob() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    request.envelope.touch_scope = vec!["libs/dispcli-core/".to_string()];
+    assert!(
+        validate_request(&request, &registry).is_ok(),
+        "a trailing-slash entry must validate against its normalized form, not reject it"
+    );
+}
+
+#[test]
+fn trailing_slash_scope_entry_normalizes_to_double_star_in_emitted_envelope() {
+    let mut request = sample_request();
+    request.envelope.touch_scope = vec!["libs/dispcli-core/".to_string()];
+    request.envelope.forbid_scope = vec!["docs/".to_string()];
+
+    let yaml = Envelope::from_request(&request).to_yaml_string();
+
+    assert!(
+        yaml.contains("touch_scope: [\"libs/dispcli-core/**\"]"),
+        "trailing-slash entry must normalize to path/** and be observable \
+         in the emitted envelope (AC7.3): {yaml}"
+    );
+    assert!(
+        yaml.contains("forbid_scope: [\"docs/**\"]"),
+        "trailing-slash entry must normalize in forbid_scope too: {yaml}"
+    );
+}
+
+// ---- Gap-3 — scope-overlap warning (tractable reading only) --------------
+
+#[test]
+fn scope_overlap_warns_on_identical_normalized_duplicate() {
+    let touch = vec!["Cargo.toml".to_string(), "libs/dispcli-core/".to_string()];
+    let forbid = vec!["libs/dispcli-core/**".to_string()];
+    let warnings = scope_overlap_warnings(&touch, &forbid);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("libs/dispcli-core/**"));
+}
+
+#[test]
+fn scope_overlap_does_not_warn_on_differing_patterns_that_would_glob_intersect() {
+    // Tractable reading only (Gap-3, v0): `libs/**` and `libs/foo.rs` overlap
+    // under true glob-intersection semantics, but are not identical
+    // normalized strings — general glob-intersection is deferred to v1+,
+    // and this function must not attempt it.
+    let touch = vec!["libs/**".to_string()];
+    let forbid = vec!["libs/foo.rs".to_string()];
+    assert!(
+        scope_overlap_warnings(&touch, &forbid).is_empty(),
+        "tractable reading must not attempt glob-intersection matching"
+    );
+}
+
+#[test]
+fn scope_overlap_returns_no_warnings_when_arrays_are_disjoint() {
+    let touch = vec!["libs/dispcli-core/**".to_string()];
+    let forbid = vec!["Cargo.toml".to_string()];
+    assert!(scope_overlap_warnings(&touch, &forbid).is_empty());
+}
+
+// ---- R7 — mode values (closed enum; "plan" rejected with dedicated msg) --
+
+#[test]
+fn parse_request_rejects_plan_mode_with_dedicated_message_and_field_detail() {
+    let request_json = format!(
+        r#"{{
+            "agent": "implementer",
+            "task_pattern": "implementation",
+            "tier": "t2",
+            "mode_override": "plan",
+            "task_body": "Do the thing.",
+            "envelope": {{
+                "dispatch_id": 1,
+                "parent_commit": "{VALID_SHA}",
+                "repo": "/abs/path/to/repo",
+                "branch": "feature-x"
+            }}
+        }}"#
+    );
+    let err = parse_request(&request_json).expect_err("plan mode should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert!(
+        err.message.contains("not dispatchable"),
+        "message must state plan mode is not dispatchable: {}",
+        err.message
+    );
+    assert_eq!(err.detail("field"), Some("mode_override"));
+    assert_eq!(err.detail("value"), Some("plan"));
+}
+
+#[test]
+fn parse_request_accepts_every_closed_permission_mode_value() {
+    for mode in ["default", "acceptEdits", "bypassPermissions", "dontAsk"] {
+        let request_json = format!(
+            r#"{{
+                "agent": "implementer",
+                "task_pattern": "implementation",
+                "tier": "t2",
+                "mode_override": "{mode}",
+                "task_body": "Do the thing.",
+                "envelope": {{
+                    "dispatch_id": 1,
+                    "parent_commit": "{VALID_SHA}",
+                    "repo": "/abs/path/to/repo",
+                    "branch": "feature-x"
+                }}
+            }}"#
+        );
+        let request = parse_request(&request_json)
+            .unwrap_or_else(|e| panic!("mode '{mode}' should parse: {e}"));
+        assert!(request.mode_override.is_some());
+    }
+}
+
+#[test]
+fn parse_registry_rejects_plan_default_mode_naming_the_offending_agent() {
+    let registry_toml = r#"
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "team/implementer.md"
+default_mode = "plan"
+worktree_required = true
+
+[blocks]
+order = []
+"#;
+    let err = parse_registry(registry_toml).expect_err("plan default_mode should be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert!(
+        err.message.contains("not dispatchable"),
+        "message must state plan mode is not dispatchable: {}",
+        err.message
+    );
+    assert_eq!(err.detail("field"), Some("agents.implementer.default_mode"));
+    assert_eq!(err.detail("value"), Some("plan"));
+}
+
+// ---- R7 — tier values (closed enum) --------------------------------------
+
+#[test]
+fn parse_request_rejects_bogus_tier_value() {
+    let request_json = format!(
+        r#"{{
+            "agent": "implementer",
+            "task_pattern": "implementation",
+            "tier": "t4",
+            "task_body": "Do the thing.",
+            "envelope": {{
+                "dispatch_id": 1,
+                "parent_commit": "{VALID_SHA}",
+                "repo": "/abs/path/to/repo",
+                "branch": "feature-x"
+            }}
+        }}"#
+    );
+    let err = parse_request(&request_json)
+        .expect_err("tier 't4' is outside t1|t2|t3 and should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+}
+
+// ---- R1 AC1.1 — missing required field -----------------------------------
+
+#[test]
+fn parse_request_rejects_missing_required_field_naming_it_in_the_message() {
+    // "agent" is omitted entirely.
+    let request_json = format!(
+        r#"{{
+            "task_pattern": "implementation",
+            "tier": "t2",
+            "task_body": "Do the thing.",
+            "envelope": {{
+                "dispatch_id": 1,
+                "parent_commit": "{VALID_SHA}",
+                "repo": "/abs/path/to/repo",
+                "branch": "feature-x"
+            }}
+        }}"#
+    );
+    let err = parse_request(&request_json).expect_err("missing required field should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert!(
+        err.message.contains("agent"),
+        "the missing field's name should appear in the error message: {}",
+        err.message
     );
 }
