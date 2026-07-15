@@ -1,11 +1,19 @@
-//! Integration tests for `dispcli-core` — Task 1 (types + parse).
+//! Integration tests for `dispcli-core` — Task 1 (types + parse) and
+//! Task 2 (resolver traits + error taxonomy).
 //!
 //! Exercises the public parse functions against string fixtures matching
-//! the R1/R2 example shapes in `docs/specs/0001-envelope-assembly.md`. No
-//! filesystem — `dispcli-core` is IO-free (architectural invariant,
-//! AC3.1).
+//! the R1/R2 example shapes in `docs/specs/0001-envelope-assembly.md`,
+//! the R8 error-kind→exit-code mapping, and the R3 `ContentResolver`/
+//! `DocumentSink` traits via in-memory fakes. No filesystem —
+//! `dispcli-core` is IO-free (architectural invariant, AC3.1).
 
-use dispcli_core::{Include, PermissionMode, Tier, parse_registry, parse_request};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+use dispcli_core::{
+    ContentResolver, DocumentSink, Error, ErrorKind, Include, PermissionMode, Tier, parse_registry,
+    parse_request,
+};
 
 const REQUEST_JSON: &str = r#"{
     "agent": "implementer",
@@ -286,5 +294,142 @@ fn include_rejects_unknown_value() {
     assert!(
         result.is_err(),
         "include outside always|worktree|task should fail to deserialize"
+    );
+}
+
+// ============================================================================
+// Task 2 — R8 error taxonomy
+// ============================================================================
+
+#[test]
+fn error_kind_maps_to_r8_exit_code_table() {
+    let cases = [
+        (ErrorKind::Usage, 2),
+        (ErrorKind::RequestInvalid, 3),
+        (ErrorKind::ConfigInvalid, 4),
+        (ErrorKind::ResolutionFailed, 5),
+        (ErrorKind::AssemblyFailed, 6),
+        (ErrorKind::IoFailed, 7),
+    ];
+    for (kind, code) in cases {
+        assert_eq!(
+            kind.exit_code(),
+            code,
+            "{kind:?} should map to exit code {code}"
+        );
+    }
+}
+
+#[test]
+fn resolution_failed_error_exposes_id_path_and_cause() {
+    let err = Error::resolution_failed("rust", "skills/rust.md", "No such file or directory");
+    assert_eq!(err.kind, ErrorKind::ResolutionFailed);
+    assert_eq!(err.detail("id"), Some("rust"));
+    assert_eq!(err.detail("path"), Some("skills/rust.md"));
+    assert_eq!(err.detail("cause"), Some("No such file or directory"));
+}
+
+#[test]
+fn error_kind_display_matches_wire_string() {
+    let cases = [
+        (ErrorKind::Usage, "usage"),
+        (ErrorKind::RequestInvalid, "request_invalid"),
+        (ErrorKind::ConfigInvalid, "config_invalid"),
+        (ErrorKind::ResolutionFailed, "resolution_failed"),
+        (ErrorKind::AssemblyFailed, "assembly_failed"),
+        (ErrorKind::IoFailed, "io_failed"),
+    ];
+    for (kind, wire) in cases {
+        assert_eq!(kind.to_string(), wire);
+        let json = serde_json::to_string(&kind).expect("kind should serialize");
+        assert_eq!(json, format!("\"{wire}\""));
+    }
+}
+
+#[test]
+fn parse_request_maps_serde_error_to_request_invalid() {
+    let result = parse_request("not json");
+    let err = result.expect_err("malformed JSON should fail to parse");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+}
+
+#[test]
+fn parse_registry_maps_toml_error_to_config_invalid() {
+    let result = parse_registry("[");
+    let err = result.expect_err("malformed TOML should fail to parse");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+}
+
+// ============================================================================
+// Task 2 — R3 resolver traits (in-memory fakes, no filesystem — AC3.1/AC3.2)
+// ============================================================================
+
+/// An in-memory `ContentResolver` fake. Proves the trait's signature
+/// takes no concrete filesystem type — a `BTreeMap` lookup satisfies it.
+struct FakeResolver {
+    files: BTreeMap<&'static str, &'static str>,
+}
+
+impl ContentResolver for FakeResolver {
+    fn resolve(&self, id: &str, path: &str) -> Result<String, Error> {
+        self.files
+            .get(path)
+            .map(|content| (*content).to_string())
+            .ok_or_else(|| Error::resolution_failed(id, path, "not found in fake resolver"))
+    }
+}
+
+#[test]
+fn content_resolver_fake_resolves_known_path() {
+    let mut files = BTreeMap::new();
+    files.insert("skills/rust.md", "rust skill content");
+    let resolver = FakeResolver { files };
+
+    let content = resolver
+        .resolve("rust", "skills/rust.md")
+        .expect("known path should resolve");
+    assert_eq!(content, "rust skill content");
+}
+
+#[test]
+fn content_resolver_fake_reports_resolution_failed_for_missing_path() {
+    let resolver = FakeResolver {
+        files: BTreeMap::new(),
+    };
+
+    let err = resolver
+        .resolve("rust", "skills/rust.md")
+        .expect_err("missing path should fail to resolve");
+    assert_eq!(err.kind, ErrorKind::ResolutionFailed);
+    assert_eq!(err.detail("id"), Some("rust"));
+    assert_eq!(err.detail("path"), Some("skills/rust.md"));
+}
+
+/// An in-memory `DocumentSink` fake. Proves the trait's signature takes
+/// no concrete filesystem type — a `RefCell<Vec<_>>` recorder satisfies
+/// it.
+struct FakeSink {
+    written: RefCell<Vec<(String, String)>>,
+}
+
+impl DocumentSink for FakeSink {
+    fn write(&self, path: &str, document: &str) -> Result<(), Error> {
+        self.written
+            .borrow_mut()
+            .push((path.to_string(), document.to_string()));
+        Ok(())
+    }
+}
+
+#[test]
+fn document_sink_fake_records_write() {
+    let sink = FakeSink {
+        written: RefCell::new(Vec::new()),
+    };
+    sink.write("/tmp/out.md", "document body")
+        .expect("fake sink write should succeed");
+    assert_eq!(
+        sink.written.borrow().as_slice(),
+        &[("/tmp/out.md".to_string(), "document body".to_string())]
     );
 }

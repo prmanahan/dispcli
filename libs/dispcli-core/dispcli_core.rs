@@ -9,7 +9,17 @@
 //! **envelope** (R4), and **summary** (R8) data types, plus string-in
 //! parsing for the request and registry. No validation beyond what
 //! serde's own shape/enum checking gives for free, no assembly logic —
-//! those land in later tasks. See `docs/specs/0001-envelope-assembly.md`.
+//! those land in later tasks.
+//!
+//! Task 2 scope: the `ContentResolver`/`DocumentSink` resolver traits
+//! (R3, the WASM seam) and the R8 error taxonomy (`Error`, `ErrorKind`,
+//! `Detail`) — the uniform failure currency every fallible function in
+//! this crate returns. `parse_request`/`parse_registry` now map their
+//! underlying `serde_json`/`toml` parse errors into `Error`
+//! (`RequestInvalid`/`ConfigInvalid`) instead of returning the raw
+//! library error types. No resolver/sink implementations (Task 3) and
+//! no R7 field-path validation (Task 6) land here.
+//! See `docs/specs/0001-envelope-assembly.md`.
 
 use std::collections::BTreeMap;
 
@@ -142,13 +152,14 @@ fn default_weight() -> String {
 /// this; `dispcli-core` never touches a filesystem or stdin.
 ///
 /// # Errors
-/// Returns the underlying `serde_json` error on malformed JSON, a
-/// missing required field, an unknown top-level or `envelope` key
-/// (`deny_unknown_fields`), or a value outside a closed enum (`tier`,
-/// `mode_override`). Mapping this into the R8 error taxonomy is a later
-/// task.
-pub fn parse_request(input: &str) -> Result<DispatchRequest, serde_json::Error> {
-    serde_json::from_str(input)
+/// Returns a [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] on
+/// malformed JSON, a missing required field, an unknown top-level or
+/// `envelope` key (`deny_unknown_fields`), or a value outside a closed
+/// enum (`tier`, `mode_override`) — the message is the underlying
+/// `serde_json` error's `Display`. Field-path-aware validation errors
+/// (R7) are a later task.
+pub fn parse_request(input: &str) -> Result<DispatchRequest, Error> {
+    serde_json::from_str(input).map_err(Error::from)
 }
 
 // ============================================================================
@@ -244,11 +255,222 @@ pub struct Registry {
 /// this (AC2.4).
 ///
 /// # Errors
-/// Returns the underlying `toml` error on malformed TOML, a missing
-/// required field, or a value outside a closed enum (`default_mode`,
-/// `include`).
-pub fn parse_registry(input: &str) -> Result<Registry, toml::de::Error> {
-    toml::from_str(input)
+/// Returns a [`ConfigInvalid`](ErrorKind::ConfigInvalid) [`Error`] on
+/// malformed TOML, a missing required field, or a value outside a
+/// closed enum (`default_mode`, `include`) — the message is the
+/// underlying `toml` error's `Display`.
+pub fn parse_registry(input: &str) -> Result<Registry, Error> {
+    toml::from_str(input).map_err(Error::from)
+}
+
+// ============================================================================
+// R8 — Error taxonomy (defined here, ahead of its spec-numbering slot,
+// because the R3 resolver traits immediately below return `Error` —
+// this keeps the file readable top-to-bottom; item order has no
+// compile-time effect in Rust)
+// ============================================================================
+
+/// One of the six kinds in the R8 error taxonomy. Every fallible
+/// function in `dispcli-core` resolves to exactly one of these — see
+/// [`ErrorKind::exit_code`] for the kind→exit-code mapping the CLI uses
+/// to set its process exit status (AC8.2). Treated as a closed
+/// vocabulary (R1 closed-vocabulary note) — same non-`#[non_exhaustive]`
+/// treatment as [`Tier`]/[`PermissionMode`]/[`Include`]: the R8 table is
+/// a fixed six-entry set, not one adopters extend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// Bad CLI flags/arguments — `cmd/dispcli` only, never emitted by
+    /// this crate.
+    Usage,
+    /// R1/R7 request-side failures.
+    RequestInvalid,
+    /// R2 registry failures.
+    ConfigInvalid,
+    /// R3 content resolution failures.
+    ResolutionFailed,
+    /// R5/R6 assembly failures (unresolved placeholder, missing section).
+    AssemblyFailed,
+    /// `DocumentSink` write failures.
+    IoFailed,
+}
+
+impl ErrorKind {
+    /// The process exit code this kind maps to (R8 table, AC8.2).
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            ErrorKind::Usage => 2,
+            ErrorKind::RequestInvalid => 3,
+            ErrorKind::ConfigInvalid => 4,
+            ErrorKind::ResolutionFailed => 5,
+            ErrorKind::AssemblyFailed => 6,
+            ErrorKind::IoFailed => 7,
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ErrorKind::Usage => "usage",
+            ErrorKind::RequestInvalid => "request_invalid",
+            ErrorKind::ConfigInvalid => "config_invalid",
+            ErrorKind::ResolutionFailed => "resolution_failed",
+            ErrorKind::AssemblyFailed => "assembly_failed",
+            ErrorKind::IoFailed => "io_failed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// One `key`/`value` entry in an [`Error`]'s `details` — structured
+/// context beyond the human-readable `message` (e.g. a
+/// `resolution_failed` error carries `id`, `path`, and `cause` entries,
+/// AC3.3). Ordered, append-only via [`Error::with_detail`] — callers
+/// look values up by name ([`Error::detail`]), not by position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detail {
+    pub key: String,
+    pub value: String,
+}
+
+impl Detail {
+    #[must_use]
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Detail {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// The uniform error shape every `dispcli-core` failure path returns
+/// (R8): a `kind` closed to the six [`ErrorKind`] values, a
+/// human-readable `message`, and structured `details` a caller
+/// (`cmd/dispcli`) renders into the
+/// `{"error": {"kind", "message", "details": [...]}}` stderr payload.
+/// This is the sole error currency the crate returns on any production
+/// path — no panics (AC8.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub details: Vec<Detail>,
+}
+
+impl Error {
+    /// Build an error of `kind` with `message` and no details.
+    #[must_use]
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Error {
+            kind,
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
+
+    /// Append one `key`/`value` detail, builder-style.
+    #[must_use]
+    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.details.push(Detail::new(key, value));
+        self
+    }
+
+    /// The value of the first detail recorded under `key`, if any.
+    #[must_use]
+    pub fn detail(&self, key: &str) -> Option<&str> {
+        self.details
+            .iter()
+            .find(|d| d.key == key)
+            .map(|d| d.value.as_str())
+    }
+
+    /// Build a `resolution_failed` error carrying the registry `id`,
+    /// the resolved `path`, and the underlying `cause` (AC3.3). The
+    /// native `dispcli-io` resolver (Task 3) is the primary caller —
+    /// nothing in `dispcli-core` invokes this yet.
+    #[must_use]
+    pub fn resolution_failed(
+        id: impl Into<String>,
+        path: impl Into<String>,
+        cause: impl Into<String>,
+    ) -> Self {
+        let id = id.into();
+        let path = path.into();
+        let cause = cause.into();
+        Error::new(
+            ErrorKind::ResolutionFailed,
+            format!("failed to resolve '{id}' at '{path}': {cause}"),
+        )
+        .with_detail("id", id)
+        .with_detail("path", path)
+        .with_detail("cause", cause)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<serde_json::Error> for Error {
+    /// Maps a request-parse failure into `request_invalid` (R1/AC1.1
+    /// territory). The message is the raw `serde_json` `Display`; no
+    /// field-path extraction — that's R7 validation (Task 6).
+    fn from(err: serde_json::Error) -> Self {
+        Error::new(ErrorKind::RequestInvalid, err.to_string())
+    }
+}
+
+impl From<toml::de::Error> for Error {
+    /// Maps a registry-parse failure into `config_invalid` (R2/AC2.1
+    /// territory). Same minimal-mapping rationale as the `serde_json`
+    /// impl above.
+    fn from(err: toml::de::Error) -> Self {
+        Error::new(ErrorKind::ConfigInvalid, err.to_string())
+    }
+}
+
+// ============================================================================
+// R3 — Resolver traits (IO boundary)
+// ============================================================================
+
+/// Registry-declared content source — the WASM seam (R3). Given the
+/// registry key `id` a path came from (e.g. `"rust"` for
+/// `[skills.rust]`) and its declared `path`, returns the file's content
+/// as a string. The native implementation (`dispcli-io`, Task 3) reads
+/// from the filesystem rooted at the registry file's directory; the
+/// future WASM host implements the same trait over host functions. No
+/// concrete filesystem type crosses this boundary — only
+/// borrowed/owned strings (AC3.1's IO-free invariant extends to this
+/// trait's signature, not just this crate's own code).
+pub trait ContentResolver {
+    /// Resolve `path` (declared under registry key `id`) to its content.
+    ///
+    /// # Errors
+    /// A [`ResolutionFailed`](ErrorKind::ResolutionFailed) [`Error`]
+    /// when the path cannot be resolved — implementations populate
+    /// `id`, `path`, and the underlying cause via
+    /// [`Error::resolution_failed`] (AC3.3).
+    fn resolve(&self, id: &str, path: &str) -> Result<String, Error>;
+}
+
+/// Assembled-document persistence — the other half of the WASM seam
+/// (R3). Given the output `path` and the assembled `document`,
+/// persists it. The native implementation (`dispcli-io`, Task 3) writes
+/// the file, creating parent directories; summary emission stays in
+/// `cmd/dispcli`. No concrete filesystem type crosses this boundary.
+pub trait DocumentSink {
+    /// Persist `document` at `path`.
+    ///
+    /// # Errors
+    /// An [`IoFailed`](ErrorKind::IoFailed) [`Error`] when the write
+    /// fails.
+    fn write(&self, path: &str, document: &str) -> Result<(), Error>;
 }
 
 // ============================================================================
