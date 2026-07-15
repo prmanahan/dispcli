@@ -507,6 +507,234 @@ pub struct Envelope {
     pub verify: Vec<String>,
 }
 
+impl Envelope {
+    /// Constructs the envelope (R4) from a request's `agent` and nested
+    /// `envelope` facts. `agent_id` is `request.agent` verbatim. When
+    /// `envelope.report_path` is null, it defaults to
+    /// `{worktree or repo}/scratch/dispatch-{dispatch_id}-report.md`
+    /// (AC4.2) — worktree takes precedence over repo when present.
+    #[must_use]
+    pub fn from_request(request: &DispatchRequest) -> Self {
+        let env = &request.envelope;
+        let working_dir = env.worktree.as_deref().unwrap_or(env.repo.as_str());
+        let report_path = env.report_path.clone().unwrap_or_else(|| {
+            format!(
+                "{working_dir}/scratch/dispatch-{}-report.md",
+                env.dispatch_id
+            )
+        });
+        Envelope {
+            dispatch_id: env.dispatch_id,
+            task_id: env.task_id,
+            agent_id: request.agent.clone(),
+            spec_id: env.spec_id.clone(),
+            spec_version: env.spec_version.clone(),
+            parent_commit: env.parent_commit.clone(),
+            repo: env.repo.clone(),
+            worktree: env.worktree.clone(),
+            branch: env.branch.clone(),
+            report_path,
+            deadline_minutes: env.deadline_minutes,
+            command_scope_subtract: env.command_scope_subtract.clone(),
+            command_scope_add: env.command_scope_add.clone(),
+            touch_scope: env.touch_scope.clone(),
+            forbid_scope: env.forbid_scope.clone(),
+            verify: env.verify.clone(),
+        }
+    }
+
+    /// Renders this envelope as the document's YAML frontmatter block
+    /// (R4) — hand-rolled string output, never a generic serializer (see
+    /// the plan's architectural invariants: AC4.1's explicit-`null`
+    /// and AC4.3's byte-stable field order aren't reliably guaranteed by
+    /// one). Every key is always emitted; absent optionals render as the
+    /// explicit token `null` (AC4.1); empty arrays render as `[]`; field
+    /// order matches the R4 schema byte-for-byte modulo values (AC4.3).
+    /// The returned string starts with `---` and ends with `---` (no
+    /// trailing newline) — callers join it with the rest of the document
+    /// via the standard inter-section separator so it becomes the first
+    /// block (AC4.4).
+    #[must_use]
+    pub fn to_yaml_string(&self) -> String {
+        let mut out = String::from("---\n");
+        out.push_str(&format!("dispatch_id: {}\n", self.dispatch_id));
+        out.push_str(&format!("task_id: {}\n", yaml_opt_int(self.task_id)));
+        out.push_str(&format!(
+            "agent_id: {}\n",
+            yaml_scalar_string(&self.agent_id)
+        ));
+        out.push_str(&format!(
+            "spec_id: {}\n",
+            yaml_opt_string(self.spec_id.as_deref())
+        ));
+        out.push_str(&format!(
+            "spec_version: {}\n",
+            yaml_opt_string(self.spec_version.as_deref())
+        ));
+        out.push_str(&format!(
+            "parent_commit: {}\n",
+            yaml_scalar_string(&self.parent_commit)
+        ));
+        out.push_str(&format!("repo: {}\n", yaml_scalar_string(&self.repo)));
+        out.push_str(&format!(
+            "worktree: {}\n",
+            yaml_opt_string(self.worktree.as_deref())
+        ));
+        out.push_str(&format!("branch: {}\n", yaml_scalar_string(&self.branch)));
+        out.push_str(&format!(
+            "report_path: {}\n",
+            yaml_scalar_string(&self.report_path)
+        ));
+        out.push_str(&format!(
+            "deadline_minutes: {}\n",
+            yaml_opt_int(self.deadline_minutes)
+        ));
+        out.push_str(&format!(
+            "command_scope_subtract: {}\n",
+            yaml_scope_override_array(&self.command_scope_subtract)
+        ));
+        out.push_str(&format!(
+            "command_scope_add: {}\n",
+            yaml_scope_override_array(&self.command_scope_add)
+        ));
+        out.push_str(&format!(
+            "touch_scope: {}\n",
+            yaml_string_array(&self.touch_scope)
+        ));
+        out.push_str(&format!(
+            "forbid_scope: {}\n",
+            yaml_string_array(&self.forbid_scope)
+        ));
+        out.push_str(&format!("verify: {}\n", yaml_string_array(&self.verify)));
+        out.push_str("---");
+        out
+    }
+}
+
+/// Renders `s` as a YAML double-quoted scalar by borrowing `serde_json`'s
+/// string escaping — JSON string syntax is a valid subset of YAML's
+/// double-quoted flow-scalar syntax (YAML 1.2: "JSON is a subset of
+/// YAML"), so this reuses a well-tested escaper without running the
+/// envelope itself through a YAML crate (the hand-rolled invariant
+/// documented on [`Envelope::to_yaml_string`]). Always quotes — the
+/// unconditional form used for flow-sequence elements ([`yaml_string_array`],
+/// [`yaml_scope_override_array`]); top-level scalar fields go through
+/// [`yaml_scalar_string`] instead, which quotes only when required.
+fn yaml_quoted_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| {
+        // Unreachable in practice — serializing a `&str` to JSON does not
+        // fail — but a hand-escaped fallback keeps this panic-free per
+        // the workspace no-panic lint set rather than reaching for
+        // `.unwrap()`/`.expect()`.
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    })
+}
+
+/// True when `s` cannot be emitted as a bare YAML plain scalar without
+/// changing its meaning or breaking the parse: empty, leading/trailing
+/// whitespace, an embedded control character (`\n`, `\r`, and the rest of
+/// the C0/C1 set — a bare plain scalar cannot carry one without splitting
+/// the document across an extra line and corrupting the field order), a
+/// reserved literal (`null`/`true`/`false`/`yes`/`no`/`on`/`off` in any
+/// case — bare would parse as a non-string type), something that parses
+/// as a number, a leading YAML indicator character, an embedded `": "` or
+/// trailing `:` (mapping-key ambiguity), or an embedded `" #"` (starts a
+/// comment mid-scalar). Conservative by design: quoting a string that
+/// didn't strictly need it is only a style mismatch against the reference
+/// format; leaving one bare that did need it is a correctness bug (a
+/// mis-parsed envelope).
+fn yaml_needs_quoting(s: &str) -> bool {
+    if s.is_empty() || s.trim() != s {
+        return true;
+    }
+    if s.chars().any(char::is_control) {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+    ) {
+        return true;
+    }
+    if s.parse::<f64>().is_ok() {
+        return true;
+    }
+    let starts_with_indicator = s
+        .chars()
+        .next()
+        .is_some_and(|c| "-?:,[]{}#&*!|>'\"%@`".contains(c));
+    if starts_with_indicator {
+        return true;
+    }
+    s.contains(": ") || s.ends_with(':') || s.contains(" #")
+}
+
+/// Renders `s` as a bare YAML plain scalar when that's unambiguous
+/// ([`yaml_needs_quoting`] is false), falling back to a double-quoted
+/// scalar otherwise. This is the reference dispatch-envelope convention
+/// this crate formalizes — `agent_id: Forge`, `repo: /abs/path` render
+/// bare; only flow-sequence elements are quoted
+/// (`touch_scope: ["libs/dispcli-core/**"]`, see [`yaml_string_array`]).
+fn yaml_scalar_string(s: &str) -> String {
+    if yaml_needs_quoting(s) {
+        yaml_quoted_string(s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Renders an `Option<i64>` as a bare YAML integer or the explicit `null`
+/// token (AC4.1) — never omitted.
+fn yaml_opt_int(n: Option<i64>) -> String {
+    match n {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// Renders an `Option<&str>` as a scalar (bare when safe, else
+/// double-quoted — [`yaml_scalar_string`]) or the explicit `null` token
+/// (AC4.1) — never omitted.
+fn yaml_opt_string(s: Option<&str>) -> String {
+    match s {
+        Some(v) => yaml_scalar_string(v),
+        None => "null".to_string(),
+    }
+}
+
+/// Renders a string list as a YAML flow sequence — `[]` when empty
+/// (AC4.1), `["a", "b"]` otherwise. Elements are always double-quoted
+/// (unlike top-level scalars) — matches the reference envelope format's
+/// `touch_scope: ["libs/dispcli-core/**"]` convention.
+fn yaml_string_array(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered: Vec<String> = items.iter().map(|s| yaml_quoted_string(s)).collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// Renders a [`ScopeOverride`] list as a YAML flow sequence of flow
+/// mappings — `[]` when empty (AC4.1),
+/// `[{capability: "...", reason: "..."}]` otherwise.
+fn yaml_scope_override_array(items: &[ScopeOverride]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|o| {
+            format!(
+                "{{capability: {}, reason: {}}}",
+                yaml_quoted_string(&o.capability),
+                yaml_quoted_string(&o.reason)
+            )
+        })
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
 // ============================================================================
 // R8 — Output contract: summary
 // ============================================================================
@@ -551,4 +779,265 @@ pub struct Summary {
     pub size: SizeSummary,
     pub verify_recipes: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+// ============================================================================
+// R5 — Prompt assembly (standard weight)
+//
+// Task 4 scope: the `standard` weight class only (`profile_sections =
+// "all"`, `blocks = "all"` — R6). Light weight (fixed skill list, XML
+// section extraction) is Task 8; a public `assemble` entry point that
+// dispatches on `request.weight` between this function and a future
+// `assemble_light` is that task's seam to add, not this one's.
+//
+// Also out of scope here (see the later tasks that own them): R7
+// request/registry validation (Task 6/7), placeholder-hardening —
+// AC5.2's unresolved-placeholder error and AC5.3's unsupported-brace
+// warnings (Task 9), and the full `Summary`/byte-accounting output
+// contract (Task 5/10). This module only proves the assembly *shape* —
+// envelope-first, fixed body order, `include`-filtered blocks,
+// best-effort placeholder substitution, and the Gap-4 byte accounting —
+// against in-memory `ContentResolver` fakes (AC3.2).
+// ============================================================================
+
+/// The inter-section separator (Gap-4, resolved 2026-07-15): consecutive
+/// assembled components — envelope, profile, each skill, each block, task
+/// body — are joined by a single blank line. Separator bytes are
+/// attributed to the *preceding* component in [`AssembledDocument::components`]
+/// (never the following one), so components sum exactly to the document's
+/// byte length (AC8.1). This is part of the output contract — adopters'
+/// goldens depend on it — so it stays a private implementation constant
+/// rather than a knob callers can vary.
+const SECTION_SEPARATOR: &str = "\n\n";
+
+/// One named, byte-accounted section of the assembled document body,
+/// pre-join. Not `pub` — [`AssembledDocument`] is the public shape
+/// Task 5 wires the CLI to; this is [`join_sections`]'s working unit.
+struct Section {
+    /// The `size.components[].section` name this content will be
+    /// reported under (R8) — `"envelope"`, `"profile:{agent}"`,
+    /// `"skill:{id}"`, `"block:{id}"`, or `"task_body"`. Composing these
+    /// into the actual `Summary`/`SizeSummary` is Task 5/10's job; this
+    /// module only produces the `(name, bytes)` pairs.
+    name: String,
+    content: String,
+}
+
+/// The result of [`assemble_standard`] — the joined document plus its
+/// per-section byte accounting (Gap-4). `components` is not yet a
+/// [`SizeSummary`] (no `total_bytes` field, no JSON emission) — building
+/// the full R8 summary from this is Task 5/10's job; this is the
+/// assembly-side seam that task wires the CLI to.
+#[derive(Debug)]
+pub struct AssembledDocument {
+    pub document: String,
+    pub components: Vec<ComponentSize>,
+}
+
+/// Assembles the standard-weight document body from `sections` in order,
+/// joining consecutive components with [`SECTION_SEPARATOR`] and
+/// attributing each separator's bytes to the *preceding* component
+/// (Gap-4). The last component carries no trailing separator.
+fn join_sections(sections: Vec<Section>) -> AssembledDocument {
+    let mut document = String::new();
+    let mut components = Vec::with_capacity(sections.len());
+    let last_index = sections.len().saturating_sub(1);
+    for (i, section) in sections.into_iter().enumerate() {
+        document.push_str(&section.content);
+        // Widening cast (usize -> u64): never lossy on any target this
+        // workspace builds for.
+        let mut bytes = section.content.len() as u64;
+        if i != last_index {
+            document.push_str(SECTION_SEPARATOR);
+            bytes += SECTION_SEPARATOR.len() as u64;
+        }
+        components.push(ComponentSize {
+            section: section.name,
+            bytes,
+        });
+    }
+    AssembledDocument {
+        document,
+        components,
+    }
+}
+
+/// Resolves the agent's profile content (R5 step 1). Returns
+/// `request_invalid` when `agent_id` has no registry entry — this
+/// previews the AC1.1 "unknown agent" rejection Task 6 formalizes with
+/// field-path detail; here it only guarantees assembly fails loudly
+/// rather than panicking on a fixture Task 6 hasn't validated yet.
+fn resolve_profile(
+    agent_id: &str,
+    registry: &Registry,
+    resolver: &dyn ContentResolver,
+) -> Result<String, Error> {
+    let agent = registry.agents.get(agent_id).ok_or_else(|| {
+        Error::new(
+            ErrorKind::RequestInvalid,
+            format!("unknown agent '{agent_id}'"),
+        )
+        .with_detail("field", "agent")
+        .with_detail("value", agent_id)
+    })?;
+    resolver.resolve(agent_id, &agent.profile)
+}
+
+/// Resolves the pattern's skill contents in declared order (R5 step 2,
+/// standard-weight slice: pattern order only — merging in `skills_add`
+/// minus `skills_remove` with dedup-keeps-first is Gap-2, deferred to
+/// Task 9). Returns `request_invalid` for an unknown `task_pattern`
+/// (previews AC1.1, see [`resolve_profile`]) and `config_invalid` for a
+/// pattern skill id with no registry entry (a dangling reference, AC2.2 —
+/// registry-internal, not caller input).
+fn resolve_skills(
+    task_pattern: &str,
+    registry: &Registry,
+    resolver: &dyn ContentResolver,
+) -> Result<Vec<(String, String)>, Error> {
+    let pattern = registry.patterns.get(task_pattern).ok_or_else(|| {
+        Error::new(
+            ErrorKind::RequestInvalid,
+            format!("unknown task_pattern '{task_pattern}'"),
+        )
+        .with_detail("field", "task_pattern")
+        .with_detail("value", task_pattern)
+    })?;
+    let mut resolved = Vec::with_capacity(pattern.skills.len());
+    for skill_id in &pattern.skills {
+        let skill = registry.skills.get(skill_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConfigInvalid,
+                format!("pattern '{task_pattern}' references unknown skill '{skill_id}'"),
+            )
+            .with_detail("pattern", task_pattern)
+            .with_detail("skill", skill_id)
+        })?;
+        let content = resolver.resolve(skill_id, &skill.path)?;
+        resolved.push((skill_id.clone(), content));
+    }
+    Ok(resolved)
+}
+
+/// Resolves template-block contents per registry `blocks.order`, filtered
+/// by `include` (R5 step 3, R2 `include` rules): `always` unconditionally,
+/// `worktree` only when `envelope.worktree` is non-null, `task` only when
+/// `envelope.task_id` is non-null. Returns `config_invalid` for a
+/// `blocks.order` entry with no matching `[blocks.<id>]` table (a
+/// dangling reference, AC2.2).
+fn resolve_blocks(
+    registry: &Registry,
+    envelope: &Envelope,
+    resolver: &dyn ContentResolver,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut resolved = Vec::new();
+    for block_id in &registry.blocks.order {
+        let block = registry.blocks.blocks.get(block_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConfigInvalid,
+                format!("blocks.order references unknown block '{block_id}'"),
+            )
+            .with_detail("block", block_id)
+        })?;
+        let included = match block.include {
+            Include::Always => true,
+            Include::Worktree => envelope.worktree.is_some(),
+            Include::Task => envelope.task_id.is_some(),
+        };
+        if included {
+            let content = resolver.resolve(block_id, &block.path)?;
+            resolved.push((block_id.clone(), content));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Applies best-effort supported-placeholder substitution (R5 placeholder
+/// table) to skill/template-block content. Substitution is unconditional
+/// text replacement — a placeholder not present in `content` is a no-op,
+/// and (Task 4 scope) a placeholder left unsubstituted is not itself an
+/// error here. AC5.2's "unresolved placeholder is an assembly error" and
+/// AC5.3's "unsupported braces pass through + warn" are placeholder
+/// *hardening*, deferred to Task 9 — this function only performs the
+/// substitution the R5 table names.
+fn substitute_placeholders(
+    content: &str,
+    request: &DispatchRequest,
+    envelope: &Envelope,
+) -> String {
+    let mut out = content.replace("{dispatch_id}", &envelope.dispatch_id.to_string());
+    if let Some(task_id) = envelope.task_id {
+        out = out.replace("{task_id}", &task_id.to_string());
+    }
+    out = out.replace("{agent_name}", &request.agent);
+    out = out.replace("{project_path}", &envelope.repo);
+    if let Some(worktree) = envelope.worktree.as_deref() {
+        out = out.replace("{worktree_path}", worktree);
+    }
+    out = out.replace("{branch}", &envelope.branch);
+    out = out.replace("{report_path}", &envelope.report_path);
+    out
+}
+
+/// Assembles a standard-weight dispatch document (R4 envelope + R5 body)
+/// from `request` and `registry`, resolving profile/skill/block content
+/// via `resolver` — no filesystem access in this crate (AC3.1/AC3.2).
+///
+/// Body order is exactly envelope → profile → skills → blocks → task body
+/// (AC5.1); the envelope is the first block (AC4.4). Skills are the
+/// pattern's declared order (standard-weight slice of R5 step 2 — see
+/// [`resolve_skills`]); blocks are `blocks.order` filtered by `include`
+/// (R5 step 3, see [`resolve_blocks`]); the task body is
+/// `request.task_body` verbatim, never placeholder-substituted. Skill and
+/// block content gets best-effort supported-placeholder substitution
+/// (R5 placeholder table); the profile and task body do not.
+///
+/// # Errors
+/// A [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] for an
+/// unknown `agent` or `task_pattern` (previews AC1.1 — full field-path
+/// validation is Task 6); a [`ConfigInvalid`](ErrorKind::ConfigInvalid)
+/// [`Error`] for a dangling registry reference (AC2.2 — full registry
+/// validation is Task 7); whatever `resolver.resolve` returns
+/// (typically [`ResolutionFailed`](ErrorKind::ResolutionFailed), AC3.3)
+/// on a content-resolution failure.
+pub fn assemble_standard(
+    request: &DispatchRequest,
+    registry: &Registry,
+    resolver: &dyn ContentResolver,
+) -> Result<AssembledDocument, Error> {
+    let envelope = Envelope::from_request(request);
+
+    let mut sections = vec![Section {
+        name: "envelope".to_string(),
+        content: envelope.to_yaml_string(),
+    }];
+
+    let profile_content = resolve_profile(&request.agent, registry, resolver)?;
+    sections.push(Section {
+        name: format!("profile:{}", request.agent),
+        content: profile_content,
+    });
+
+    for (skill_id, content) in resolve_skills(&request.task_pattern, registry, resolver)? {
+        let content = substitute_placeholders(&content, request, &envelope);
+        sections.push(Section {
+            name: format!("skill:{skill_id}"),
+            content,
+        });
+    }
+
+    for (block_id, content) in resolve_blocks(registry, &envelope, resolver)? {
+        let content = substitute_placeholders(&content, request, &envelope);
+        sections.push(Section {
+            name: format!("block:{block_id}"),
+            content,
+        });
+    }
+
+    sections.push(Section {
+        name: "task_body".to_string(),
+        content: request.task_body.clone(),
+    });
+
+    Ok(join_sections(sections))
 }
