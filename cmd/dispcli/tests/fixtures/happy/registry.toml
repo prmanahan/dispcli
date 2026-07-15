@@ -1,0 +1,31 @@
+# Happy-path fixture registry (Task 5 red phase, spec 0001).
+#
+# Minimal by design: one agent, one pattern with one skill, one
+# always-included block, standard weight. All paths are registry-dir-
+# relative (R3); `skills_root` is declared but reserved/unused in v0
+# (AC2.5, Gap-1) — resolution never applies it as a prefix.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"

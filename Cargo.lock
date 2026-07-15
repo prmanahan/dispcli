@@ -157,6 +157,8 @@ dependencies = [
  "clap",
  "dispcli-core",
  "dispcli-io",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
