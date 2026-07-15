@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — 2026-07-12 |
+| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 |
 | **Scope** | v0: dispatch-request input schema, registry config, resolver traits, envelope + prompt construction, CLI output contract |
 | **Out of scope** | Worktree execution, cost-metric emission, post-dispatch verification, WASM/plugin frontend (all v1+) |
 
@@ -154,6 +154,11 @@ blocks = ["metrics", "working-dir", "scope-boundaries"]
   `task`); anything else is a config error.
 - AC2.4 — Registry parsing lives in `dispcli-core` operating on a string;
   only the file read is in `dispcli-io`.
+- AC2.5 — **`skills_root` is reserved in v0** (gap resolution 2026-07-15):
+  all path resolution is relative to the registry file's directory (R3);
+  `skills_root` is **not** applied as a prefix. Adopters set each entry's
+  `path` relative to the registry dir. Reserved for a future rooting
+  convention (see Deferred).
 
 ## R3 — Resolver traits (IO boundary)
 
@@ -222,11 +227,21 @@ verify: []
 The document body after the envelope is assembled in fixed order:
 
 1. Agent profile (sections per weight class — R6)
-2. Skills — pattern mapping, plus `skills_add`, minus `skills_remove`,
-   in registry order; weight classes with a fixed `skills` list bypass
-   the pattern mapping entirely
+2. Skills — the pattern's `skills` array in its declared order, then
+   `skills_add` in array order, minus `skills_remove`; a skill appearing
+   more than once is emitted **once at its first occurrence** (dedup keeps
+   first position) — gap resolution 2026-07-15, pinning "in registry order".
+   Weight classes with a fixed `skills` list bypass the pattern mapping
+   entirely
 3. Template blocks — registry `blocks.order`, filtered by `include` rules
 4. Task body, verbatim
+
+**Section joining (gap resolution 2026-07-15).** Consecutive assembled
+components (envelope, profile, each skill, each block, task body) are joined
+by a single blank line (`\n\n`). Each separator's bytes are attributed to
+the **preceding** component in the size accounting (R8), so components sum
+exactly to the document byte length. The `\n\n` joining is part of the
+output contract — adopters' goldens depend on it.
 
 Placeholder substitution applies to skill and template-block content (not
 the profile, not the task body). Supported placeholders:
@@ -272,7 +287,11 @@ order. The registry defines them (R2); the request selects one.
 
 - AC6.1 — Section extraction matches top-level XML tags only; a tag named
   in the weight class but absent from the profile is an assembly error
-  naming agent and tag.
+  naming agent and tag. **Extraction is span-based** (gap resolution
+  2026-07-15): "top-level" means outermost nesting depth, and sections are
+  matched as the outermost `<tag>…</tag>` spans by line/position — profiles
+  are markdown-with-XML, not well-formed single-root XML, so an XML parser
+  MUST NOT be used.
 - AC6.2 — The summary reports which weight class applied and the resulting
   component sizes (R8), so the operator can confirm a light dispatch
   actually came out light.
@@ -289,7 +308,7 @@ within a class).
 | `repo`, `worktree`, `report_path` | Absolute paths when non-null. |
 | `verify` entries | Trim whitespace; strip a leading `just ` token; reject empty results; reject any entry containing shell metacharacters (`& \| ; > < \` $ ( ) \n \r`); whitespace-split into recipe + args. dispcli does not confirm the recipe exists (that requires running the target project's tooling) — the summary carries the parsed recipe names so the caller can. |
 | `command_scope_subtract` / `_add` entries | Both `capability` and `reason` required and non-empty. No reason to give means the override should not exist. |
-| Scope globs | Each `touch_scope` / `forbid_scope` entry must compile as a glob pattern. A trailing-slash entry (`path/`) is normalized to `path/**` before emission, mirroring downstream enforcement semantics. A path matching patterns in both arrays is a warning (forbid wins downstream). |
+| Scope globs | Each `touch_scope` / `forbid_scope` entry must compile as a glob pattern. A trailing-slash entry (`path/`) is normalized to `path/**` before emission, mirroring downstream enforcement semantics. **Overlap detection (v0, gap resolution 2026-07-15):** an *identical normalized pattern string* present in both `touch_scope` and `forbid_scope` emits a warning (forbid wins downstream); general glob-intersection over differing patterns is deferred to v1+. |
 | Mode values | `mode_override` and registry `default_mode` are a closed enum: `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`. `plan` is rejected with an error stating plan mode is not dispatchable. |
 | `tier` | Closed enum: `t1`, `t2`, `t3`. Recorded and echoed in the summary; never branches assembly behavior in v0 (reserved for v1 metrics emission). |
 
@@ -352,7 +371,8 @@ Errors print a JSON object to stderr — `{"error": {"kind", "message", "details
 
 - AC8.1 — Success emits exactly one JSON object on stdout and exits 0;
   size components sum to `total_bytes` and match the written document's
-  byte length.
+  byte length. Inter-section separator (`\n\n`, R5) bytes are attributed to
+  the preceding component, so the sum is exact.
 - AC8.2 — Every error kind maps to its exit code; stdout stays empty on
   any failure (machine callers can trust stdout = success payload).
 - AC8.3 — `worktree.commands` is present and empty (not null/omitted)
@@ -399,7 +419,9 @@ dispcli assemble --request <path|-> [--config <path>] [--out <path>]
 
 Worktree execution (v0 emits the commands, never runs them), cost-metric
 emission, post-dispatch git verification, recipe-existence checking
-against the target project, profile/skill content linting, and the WASM
-Component Model frontend. The `ContentResolver`/`DocumentSink` traits are
+against the target project, profile/skill content linting, general
+glob-intersection scope-overlap detection (v0 warns only on
+identical-pattern duplicates — R7), a `skills_root` rooting convention
+(reserved — R2/AC2.5), and the WASM Component Model frontend. The `ContentResolver`/`DocumentSink` traits are
 the seam the WASM port re-implements; nothing in this spec may assume a
 filesystem beyond `dispcli-io`.
