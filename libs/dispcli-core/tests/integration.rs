@@ -15,7 +15,7 @@ use dispcli_core::{
     DocumentSink, Envelope, EnvelopeRequest, Error, ErrorKind, Include, PatternEntry,
     PermissionMode, Registry, RegistryMeta, ScopeOverride, SkillEntry, Tier, WeightClass,
     assemble_standard, parse_registry, parse_request, parse_verify_entry, scope_overlap_warnings,
-    validate_registry, validate_request,
+    unsupported_brace_tokens, validate_registry, validate_request,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -1905,5 +1905,383 @@ fn validate_registry_collects_dangling_references_across_patterns_blocks_and_wei
             "ghost-weight-skill",
             "ghost-weight-block",
         ]
+    );
+}
+
+// ============================================================================
+// Task 9 — R5 placeholder-substitution completeness (AC5.2/AC5.3/AC5.4):
+// unresolved-supported-placeholder assembly failures, unsupported-brace-
+// token warnings, and the full skill-merge rule (pattern order, then
+// skills_add, dedup-keeps-first, minus skills_remove — Gap-2, ruled
+// 2026-07-15).
+// ============================================================================
+
+// ---- AC5.4 / Gap-2 — skill merge: pattern + skills_add, dedup, remove ---
+
+#[test]
+fn resolve_skills_merges_pattern_and_skills_add_with_dedup_keeping_first_occurrence() {
+    let mut registry = sample_registry();
+    registry.skills.insert(
+        "tdd".to_string(),
+        SkillEntry {
+            path: "skills/tdd.md".to_string(),
+        },
+    );
+    let mut files = full_resolver().files;
+    files.insert("skills/tdd.md", "TDD SKILL CONTENT");
+    let resolver = FakeResolver { files };
+
+    let mut request = sample_request();
+    // "verify" is already in the pattern's skill list — this must not
+    // duplicate it or move it to the skills_add position. "tdd" is new.
+    request.skills_add = vec!["verify".to_string(), "tdd".to_string()];
+
+    let assembled = assemble_standard(&request, &registry, &resolver)
+        .expect("skills_add merge should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:verify", "skill:rust", "skill:tdd"],
+        "AC5.4/Gap-2: pattern order first, then skills_add in array order, \
+         with the duplicate 'verify' kept at its FIRST occurrence (pattern \
+         position) — dedup keeps first occurrence, not last"
+    );
+    assert_eq!(
+        assembled.document.matches("VERIFY SKILL CONTENT").count(),
+        1,
+        "a skill present via both the pattern mapping and skills_add must \
+         be included exactly once (AC5.4)"
+    );
+}
+
+#[test]
+fn resolve_skills_applies_skills_remove_to_a_pattern_skill() {
+    let registry = sample_registry();
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.skills_remove = vec!["rust".to_string()];
+
+    let assembled = assemble_standard(&request, &registry, &resolver)
+        .expect("removing a present pattern skill should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:verify"],
+        "skills_remove must drop the matching skill from the effective set"
+    );
+    assert!(!assembled.document.contains("RUST SKILL CONTENT"));
+}
+
+#[test]
+fn validate_request_rejects_skills_remove_of_skill_absent_from_effective_set() {
+    let mut registry = sample_registry();
+    // "tdd" is a real registry skill (passes the AC1.1 unknown-id check)
+    // but is not part of the "implementation" pattern nor skills_add —
+    // absent from the effective set.
+    registry.skills.insert(
+        "tdd".to_string(),
+        SkillEntry {
+            path: "skills/tdd.md".to_string(),
+        },
+    );
+    let mut request = sample_request();
+    request.skills_remove = vec!["tdd".to_string()];
+
+    let err = validate_request(&request, &registry)
+        .expect_err("skills_remove of a skill absent from the effective set should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("skills_remove[0]"));
+    assert_eq!(err.detail("value"), Some("tdd"));
+}
+
+#[test]
+fn assemble_standard_rejects_skills_remove_of_skill_absent_from_effective_set() {
+    // Defense-in-depth counterpart to the validate_request test above —
+    // assemble_standard must independently enforce AC5.4 when called
+    // without validate_request having run first (same precedent as the
+    // existing unknown-agent/unknown-task_pattern defense-in-depth
+    // checks).
+    let mut registry = sample_registry();
+    registry.skills.insert(
+        "tdd".to_string(),
+        SkillEntry {
+            path: "skills/tdd.md".to_string(),
+        },
+    );
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.skills_remove = vec!["tdd".to_string()];
+
+    let err = assemble_standard(&request, &registry, &resolver)
+        .expect_err("assembly must independently reject skills_remove of an absent skill (AC5.4)");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("skills_remove[0]"));
+    assert_eq!(err.detail("value"), Some("tdd"));
+}
+
+#[test]
+fn validate_request_reports_unknown_registry_id_before_absent_from_effective_set_class() {
+    let registry = sample_registry();
+    let mut request = sample_request();
+    // "ghost" is not a registered skill at all -> the unknown-id class
+    // (checked first) must fire, not the absent-from-effective-set class.
+    request.skills_remove = vec!["ghost".to_string()];
+    let err = validate_request(&request, &registry)
+        .expect_err("skills_remove of a wholly unregistered skill should be rejected");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("skills_remove[0]"));
+    assert_eq!(err.detail("value"), Some("ghost"));
+    assert!(
+        err.message.contains("unknown registry ids"),
+        "the unknown-id class must fire before the absent-from-effective-set \
+         class for a skill id that isn't even registered: {}",
+        err.message
+    );
+}
+
+#[test]
+fn assemble_standard_reports_dangling_skills_add_entry_as_request_invalid() {
+    // AC1.1: an unknown skill id in skills_add is a request-side problem
+    // (the caller named a skill that doesn't exist) — distinct from the
+    // pattern-sourced dangling-reference case (config_invalid, AC2.2)
+    // covered by `assemble_standard_reports_dangling_pattern_skill_as_config_invalid`
+    // above. Only reachable when assemble_standard runs without
+    // validate_request having caught it first as an AC1.1 unknown id.
+    let registry = sample_registry();
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.skills_add = vec!["ghost-add-skill".to_string()];
+
+    let err = assemble_standard(&request, &registry, &resolver)
+        .expect_err("skills_add referencing an undeclared skill should fail assembly");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("skills_add[0]"));
+    assert_eq!(err.detail("value"), Some("ghost-add-skill"));
+}
+
+// ---- AC5.2 — unresolved supported placeholder is an assembly error ------
+
+#[test]
+fn assemble_standard_reports_unresolved_worktree_path_placeholder_as_assembly_failed() {
+    // AC5.2's own example: {worktree_path} used by an included block in a
+    // non-worktree dispatch. "metrics" is include=always, so it's present
+    // regardless of worktree — the request's worktree stays null.
+    let registry = sample_registry();
+    let resolver = FakeResolver {
+        files: BTreeMap::from([
+            ("team/implementer.md", "PROFILE CONTENT"),
+            ("skills/verify.md", "VERIFY SKILL CONTENT"),
+            ("skills/rust.md", "RUST SKILL CONTENT"),
+            (
+                "skills/dispatch-metrics.md",
+                "Run commands from {worktree_path}.",
+            ),
+        ]),
+    };
+    let mut request = sample_request();
+    request.envelope.worktree = None;
+
+    let err = assemble_standard(&request, &registry, &resolver).expect_err(
+        "an always-included block referencing {worktree_path} in a non-worktree \
+         dispatch must fail assembly, not silently emit the literal token",
+    );
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("section"), Some("block:metrics"));
+    assert_eq!(err.detail("placeholder"), Some("{worktree_path}"));
+}
+
+#[test]
+fn unresolved_task_id_placeholder_in_always_included_skill_is_intentional_assembly_failure() {
+    // Intentional-gap note (spec 0001 Task 9 dispatch): {task_id}/
+    // {worktree_path} substitute only when non-null and are safe ONLY
+    // inside include=task/include=worktree blocks (filtered out when
+    // null). An ALWAYS-included skill referencing {task_id} in a
+    // no-task dispatch is a genuine, INTENDED assembly error under
+    // AC5.2 — a registry-authoring mistake the spec wants surfaced
+    // loudly, not a bug in this test or in assemble_standard.
+    let registry = sample_registry();
+    let resolver = FakeResolver {
+        files: BTreeMap::from([
+            ("team/implementer.md", "PROFILE CONTENT"),
+            ("skills/verify.md", "Track progress against task {task_id}."),
+            ("skills/rust.md", "RUST SKILL CONTENT"),
+            ("skills/dispatch-metrics.md", "METRICS BLOCK CONTENT"),
+        ]),
+    };
+    let mut request = sample_request();
+    request.envelope.task_id = None;
+
+    let err = assemble_standard(&request, &registry, &resolver).expect_err(
+        "an always-included skill referencing {task_id} with no task_id must fail \
+         assembly under AC5.2 — this is the intended behavior, not a bug",
+    );
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("section"), Some("skill:verify"));
+    assert_eq!(err.detail("placeholder"), Some("{task_id}"));
+}
+
+// ---- AC5.3 — unsupported brace tokens pass through + warn ---------------
+
+#[test]
+fn unsupported_brace_tokens_finds_placeholder_shaped_tokens_outside_the_supported_set() {
+    let content = "See {foo_bar} and {task_id} and {dispatch_id} for details.";
+    let tokens = unsupported_brace_tokens(content);
+    assert_eq!(
+        tokens,
+        vec!["{foo_bar}".to_string()],
+        "supported placeholders ({{task_id}}, {{dispatch_id}}) must not be \
+         reported; only the unsupported {{foo_bar}} should surface"
+    );
+}
+
+#[test]
+fn unsupported_brace_tokens_ignores_non_identifier_shaped_braces() {
+    // Rust code / JSON braces legitimately appearing in skill content
+    // must not be misreported as unresolved placeholders (R5: "skill
+    // content legitimately contains braces").
+    let content = "fn foo() { let x = Self {}; } and {\"key\": \"value\"} and { spaced }";
+    assert!(
+        unsupported_brace_tokens(content).is_empty(),
+        "non-identifier-shaped brace content must not be treated as a \
+         placeholder token"
+    );
+}
+
+#[test]
+fn unsupported_brace_tokens_deduplicates_within_one_call() {
+    let content = "{ghost} appears twice: {ghost}.";
+    let tokens = unsupported_brace_tokens(content);
+    assert_eq!(
+        tokens,
+        vec!["{ghost}".to_string()],
+        "a repeated unsupported token within one section must be reported once"
+    );
+}
+
+#[test]
+fn unsupported_brace_tokens_excludes_hyphen_and_dot_shaped_tokens() {
+    // Deliberate v0 recall sacrifice (Task 9 Q1 ruling; upheld by Warden
+    // review dispatch-1642 with a corrected cost accounting — see below).
+    // The token shape `is_placeholder_ident` accepts is `{identifier}` —
+    // ASCII alphanumeric + underscore only. A hyphenated or dotted
+    // block-id-shaped typo like `{merge-msg}` or `{a.b}` is NOT warned;
+    // widening this shape to accept `-`/`.` is a behavior change that
+    // must break this test.
+    //
+    // The cost of this choice is NOT the false negative it looks like at
+    // first glance. Typo-recall largely survives: every supported
+    // placeholder is snake_case, and snake_case typos stay snake_case
+    // (`{worktree_paths}`, `{wortree_path}`, `{dispatchid}` are all still
+    // caught) — `{merge-msg}` requires confusing a block id for a
+    // placeholder, a narrow slice of typo-space.
+    //
+    // The more consequential cost is the opposite direction: false
+    // POSITIVES on code content. `is_ascii_alphanumeric()` accepts
+    // digits, so `{0}`/`{1}` (Rust positional format args) and `{name}`
+    // in `format!("{name}")` DO warn — real noise on Rust-focused skill
+    // files that legitimately contain format strings. That noise is
+    // accepted deliberately: false negatives degrade gracefully (the
+    // token passes through verbatim, visible in the document — AC5.3's
+    // pass-through is by design), while false positives train operators
+    // to ignore warnings. AC5.3 itself justifies pass-through with
+    // "skill content legitimately contains braces," so biasing toward
+    // precision over recall here is the spec-aligned instinct.
+    assert!(unsupported_brace_tokens("see {merge-msg} and {a.b}").is_empty());
+    assert_eq!(
+        unsupported_brace_tokens("see {merge_msg}"),
+        vec!["{merge_msg}".to_string()]
+    );
+}
+
+#[test]
+fn unsupported_brace_token_survives_verbatim_and_is_recorded_as_a_warning() {
+    let registry = sample_registry();
+    let resolver = FakeResolver {
+        files: BTreeMap::from([
+            ("team/implementer.md", "PROFILE CONTENT"),
+            (
+                "skills/verify.md",
+                "Configure via {some_unknown_token} in your environment.",
+            ),
+            ("skills/rust.md", "RUST SKILL CONTENT"),
+            ("skills/dispatch-metrics.md", "METRICS BLOCK CONTENT"),
+        ]),
+    };
+    let request = sample_request();
+
+    let assembled = assemble_standard(&request, &registry, &resolver)
+        .expect("an unsupported brace token must not fail assembly");
+
+    // AC5.3 — passed through untouched.
+    assert!(
+        assembled
+            .document
+            .contains("Configure via {some_unknown_token} in your environment.")
+    );
+    // AC5.3 — surfaced in warnings for operator review.
+    assert_eq!(assembled.warnings.len(), 1);
+    assert!(assembled.warnings[0].contains("{some_unknown_token}"));
+    assert!(assembled.warnings[0].contains("skill:verify"));
+}
+
+#[test]
+fn warnings_stay_distinct_across_sections() {
+    // Within-section dedup (the repeated {ghost} inside skill:verify
+    // collapsing to one warning) is proved by
+    // `unsupported_brace_tokens_deduplicates_within_one_call` — that
+    // dedup happens inside `unsupported_brace_tokens` itself, before
+    // `record_brace_warnings` ever sees the token list. This test proves
+    // the distinct claim: the *same* token recurring in a *different*
+    // section is not collapsed into the first section's warning.
+    let registry = sample_registry();
+    let resolver = FakeResolver {
+        files: BTreeMap::from([
+            ("team/implementer.md", "PROFILE CONTENT"),
+            (
+                "skills/verify.md",
+                "{ghost} shows up twice in this skill: {ghost}.",
+            ),
+            ("skills/rust.md", "RUST SKILL CONTENT"),
+            (
+                "skills/dispatch-metrics.md",
+                "{ghost} also appears in this block.",
+            ),
+        ]),
+    };
+    let request = sample_request();
+
+    let assembled = assemble_standard(&request, &registry, &resolver)
+        .expect("unsupported brace tokens must not fail assembly");
+
+    assert_eq!(
+        assembled.warnings.len(),
+        2,
+        "the repeated {{ghost}} within skill:verify collapses to one warning, \
+         but the separate occurrence in block:metrics is a distinct warning: {:?}",
+        assembled.warnings
+    );
+    assert!(
+        assembled
+            .warnings
+            .iter()
+            .any(|w| w.contains("skill:verify"))
+    );
+    assert!(
+        assembled
+            .warnings
+            .iter()
+            .any(|w| w.contains("block:metrics"))
     );
 }
