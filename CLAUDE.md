@@ -43,9 +43,10 @@ justfile, clippy.toml, deny.toml, .github/
 `docs/specs/` holds the authoritative feature specs; `docs/src/` is the
 mdBook that renders them for contributors.
 
-**Current status:** scaffold + spec-driven. Spec 0001 (envelope assembly)
-defines the first feature; implementation has not started yet — don't go
-looking for code that isn't there.
+**Current status:** spec-driven build in progress against
+`docs/specs/0001-envelope-assembly.md`. This file does not track build
+progress — a hardcoded status line here rots. For what is built versus
+outstanding, read the spec's task list and `git log`.
 
 ## Layout conventions
 
