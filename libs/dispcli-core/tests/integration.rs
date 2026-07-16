@@ -15,7 +15,7 @@ use dispcli_core::{
     DocumentSink, Envelope, EnvelopeRequest, Error, ErrorKind, Include, PatternEntry,
     PermissionMode, Registry, RegistryMeta, ScopeOverride, SkillEntry, Tier, WeightClass,
     assemble_standard, parse_registry, parse_request, parse_verify_entry, scope_overlap_warnings,
-    validate_request,
+    validate_registry, validate_request,
 };
 
 const REQUEST_JSON: &str = r#"{
@@ -990,6 +990,29 @@ fn assemble_standard_propagates_resolution_failure_from_resolver() {
     assert_eq!(err.kind, ErrorKind::ResolutionFailed);
 }
 
+#[test]
+fn assemble_standard_resolution_failure_names_the_registry_key_and_declared_path() {
+    // R2/AC2.1: "a registry referencing a file that cannot be resolved
+    // fails at assembly time with an error naming the registry key and
+    // the path." Removes only the "rust" skill's file from an otherwise-
+    // complete resolver so the failure is unambiguous about which
+    // registry key/path it names — a bare `ErrorKind` check (as in
+    // `assemble_standard_propagates_resolution_failure_from_resolver`
+    // above) wouldn't distinguish "failed" from "failed naming the right
+    // thing".
+    let registry = sample_registry();
+    let mut files = full_resolver().files;
+    files.remove("skills/rust.md");
+    let resolver = FakeResolver { files };
+    let request = sample_request();
+
+    let err = assemble_standard(&request, &registry, &resolver)
+        .expect_err("missing skill content should fail assembly");
+    assert_eq!(err.kind, ErrorKind::ResolutionFailed);
+    assert_eq!(err.detail("id"), Some("rust"));
+    assert_eq!(err.detail("path"), Some("skills/rust.md"));
+}
+
 // ============================================================================
 // Warden review round (dispatch 1595) — section naming coverage + untested
 // error branches (AC1.1/AC2.2) + control-char scalar quoting.
@@ -1633,6 +1656,33 @@ order = []
     assert_eq!(err.detail("value"), Some("plan"));
 }
 
+// ---- R2 AC2.3 — `include` values (closed enum) ---------------------------
+
+#[test]
+fn parse_registry_rejects_include_value_outside_closed_enum() {
+    // R2/AC2.3: `include` is closed to always|worktree|task. No new
+    // runtime check is needed for this in `validate_registry` — `Include`
+    // is already a closed 3-variant enum (Task 1), so a value outside the
+    // set fails at `parse_registry` time, mapped to `config_invalid` by
+    // the standard `toml::de::Error` mapping (`From<toml::de::Error>`) —
+    // same "define errors out of existence" treatment `Tier`/
+    // `PermissionMode` get elsewhere in this file.
+    let registry_toml = r#"
+[registry]
+skills_root = "skills"
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "skills/dispatch-metrics.md"
+include = "sometimes"
+"#;
+    let err = parse_registry(registry_toml)
+        .expect_err("include value outside always|worktree|task should be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+}
+
 // ---- R7 — tier values (closed enum) --------------------------------------
 
 #[test]
@@ -1680,5 +1730,180 @@ fn parse_request_rejects_missing_required_field_naming_it_in_the_message() {
         err.message.contains("agent"),
         "the missing field's name should appear in the error message: {}",
         err.message
+    );
+}
+
+// ============================================================================
+// Task 7 — R2 AC2.2 registry self-consistency validation
+// (`validate_registry`). AC2.1 (unresolvable paths) is exercised at the
+// dispcli-io resolver level (see that crate's integration tests) plus
+// `assemble_standard_resolution_failure_names_the_registry_key_and_declared_path`
+// above; AC2.3 (closed `include` enum) is exercised via `parse_registry`
+// directly — see `parse_registry_rejects_include_value_outside_closed_enum`
+// above.
+// ============================================================================
+
+#[test]
+fn validate_registry_accepts_self_consistent_registry() {
+    let registry = sample_registry();
+    validate_registry(&registry).expect("sample_registry's own cross-references should validate");
+}
+
+#[test]
+fn validate_registry_rejects_dangling_pattern_skill_with_field_and_value() {
+    let mut registry = sample_registry();
+    registry
+        .patterns
+        .get_mut("implementation")
+        .expect("pattern present in fixture")
+        .skills = vec!["verify".to_string(), "ghost-skill".to_string()];
+
+    let err = validate_registry(&registry)
+        .expect_err("pattern referencing an undeclared skill id should be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(
+        err.detail("field"),
+        Some("patterns.implementation.skills[1]")
+    );
+    assert_eq!(err.detail("value"), Some("ghost-skill"));
+}
+
+#[test]
+fn validate_registry_rejects_dangling_blocks_order_entry_with_field_and_value() {
+    let mut registry = sample_registry();
+    registry.blocks.order = vec!["metrics".to_string(), "ghost-block".to_string()];
+
+    let err = validate_registry(&registry)
+        .expect_err("blocks.order referencing an undeclared block id should be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(err.detail("field"), Some("blocks.order[1]"));
+    assert_eq!(err.detail("value"), Some("ghost-block"));
+}
+
+#[test]
+fn validate_registry_rejects_dangling_weight_skill_with_field_and_value() {
+    let mut registry = sample_registry();
+    registry.weights.insert(
+        "light".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: Some(vec!["ghost-skill".to_string()]),
+            blocks: AllOrList::All("all".to_string()),
+        },
+    );
+
+    let err = validate_registry(&registry)
+        .expect_err("weight class referencing an undeclared skill id should be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(err.detail("field"), Some("weights.light.skills[0]"));
+    assert_eq!(err.detail("value"), Some("ghost-skill"));
+}
+
+#[test]
+fn validate_registry_rejects_dangling_weight_block_list_entry_with_field_and_value() {
+    let mut registry = sample_registry();
+    registry.weights.insert(
+        "light".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: None,
+            blocks: AllOrList::List(vec!["metrics".to_string(), "ghost-block".to_string()]),
+        },
+    );
+
+    let err = validate_registry(&registry).expect_err(
+        "weight class block list referencing an undeclared block id should be rejected",
+    );
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(err.detail("field"), Some("weights.light.blocks[1]"));
+    assert_eq!(err.detail("value"), Some("ghost-block"));
+}
+
+#[test]
+fn validate_registry_accepts_weight_class_all_sentinel_without_treating_it_as_a_dangling_id() {
+    // Trap 1 (spec "open vs. closed vocabularies" note): the `"all"`
+    // sentinel is a closed-vocabulary VALUE, not an id to resolve. A
+    // naive implementation that iterated `AllOrList::All(s)` as if it
+    // held a one-element id list would report "all" as a dangling block
+    // id (no `[blocks.all]` table exists) — this pins that it must not.
+    let registry_toml = r#"
+[registry]
+skills_root = "skills"
+
+[blocks]
+order = []
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"
+"#;
+    let registry = parse_registry(registry_toml).expect("well-formed registry should parse");
+    validate_registry(&registry)
+        .expect("the \"all\" sentinel must never be checked as a dangling block id");
+}
+
+#[test]
+fn validate_registry_accepts_weight_class_with_valid_explicit_skill_and_block_lists() {
+    // Boundary-acceptance counterpart to the two dangling-weight-list
+    // rejection tests above: a weight class using the `AllOrList::List`
+    // form (not the sentinel) with every entry declared should validate
+    // cleanly.
+    let mut registry = sample_registry();
+    registry.weights.insert(
+        "light".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::List(vec!["role".to_string()]),
+            skills: Some(vec!["verify".to_string()]),
+            blocks: AllOrList::List(vec!["metrics".to_string()]),
+        },
+    );
+
+    validate_registry(&registry)
+        .expect("weight class with fully-declared explicit skill/block lists should validate");
+}
+
+#[test]
+fn validate_registry_collects_dangling_references_across_patterns_blocks_and_weights_together() {
+    let mut registry = sample_registry();
+    registry
+        .patterns
+        .get_mut("implementation")
+        .expect("pattern present in fixture")
+        .skills = vec!["ghost-pattern-skill".to_string()];
+    registry.blocks.order = vec!["ghost-block".to_string()];
+    registry.weights.insert(
+        "light".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: Some(vec!["ghost-weight-skill".to_string()]),
+            blocks: AllOrList::List(vec!["ghost-weight-block".to_string()]),
+        },
+    );
+
+    let err = validate_registry(&registry)
+        .expect_err("dangling refs across all four sources should be rejected together");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(
+        err.all_details("field"),
+        vec![
+            "patterns.implementation.skills[0]",
+            "blocks.order[0]",
+            "weights.light.skills[0]",
+            "weights.light.blocks[0]",
+        ],
+        "one combined class: every dangling reference across patterns, \
+         blocks.order, and weights must be collected together, not \
+         source-by-source (same treatment validate_request gives its \
+         unknown-id class spanning agent/task_pattern/weight/skills_add/\
+         skills_remove)"
+    );
+    assert_eq!(
+        err.all_details("value"),
+        vec![
+            "ghost-pattern-skill",
+            "ghost-block",
+            "ghost-weight-skill",
+            "ghost-weight-block",
+        ]
     );
 }

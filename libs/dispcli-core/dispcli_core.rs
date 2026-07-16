@@ -23,8 +23,18 @@
 //! validation stage, collecting every instance of the first failing
 //! class with a field-path + offending-value [`Error::all_details`] pair
 //! per instance. R2/AC2.1-2.3 registry self-consistency validation
-//! (dangling references, closed `include` enum, resolvable paths) is a
-//! separate, later task's job. See `docs/specs/0001-envelope-assembly.md`.
+//! (dangling references, closed `include` enum, resolvable paths) is
+//! [`validate_registry`] (Task 7, below). See
+//! `docs/specs/0001-envelope-assembly.md`.
+//!
+//! Task 7 scope: [`validate_registry`] — R2 AC2.2 registry
+//! self-consistency validation, the registry-only sibling of
+//! `validate_request`: every id a pattern, weight class, or
+//! `blocks.order` entry references must be declared in the registry,
+//! collected into one combined `config_invalid` error naming every
+//! dangling reference (not source-by-source). AC2.3 (closed `include`
+//! enum) and AC2.1 (resolvable paths) need no new code here — see
+//! `validate_registry`'s own doc comment for why.
 
 use std::collections::BTreeMap;
 
@@ -1174,6 +1184,109 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
             ErrorKind::RequestInvalid,
             "one or more touch_scope/forbid_scope entries do not compile as a glob",
             bad_globs,
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// R2 AC2.2 — Registry self-consistency validation (Task 7)
+//
+// `validate_registry` is a standalone pre-flight check, the registry-only
+// sibling of `validate_request` (Task 6) — same collect-all-in-class
+// `class_error` idiom, same relationship to the pipeline: wiring it into
+// `cmd/dispcli` ahead of `assemble_standard` is a later task's job (this
+// crate exposes the function; it does not call itself). `resolve_skills`/
+// `resolve_blocks` (Task 4, R5) already carry their own ad hoc dangling-
+// reference guards as assembly-time defense-in-depth, with their own
+// pre-existing detail-key conventions (`"pattern"`/`"skill"`, `"block"`)
+// — left untouched here; `validate_registry` is the new authoritative
+// pre-flight check with its own `"field"`/`"value"` convention, matching
+// `validate_request`'s. Divergent detail keys between call sites for the
+// same underlying condition is the same intentional non-reconciliation
+// the `Error` doc comment already covers for `message` wording.
+// ============================================================================
+
+/// Validates `registry` for self-consistency (R2 AC2.2): every id
+/// referenced by a `[patterns.<id>]`'s `skills`, a `[weights.<id>]`'s
+/// `skills` or `blocks` (list form), or `blocks.order` must be declared
+/// in the registry. One combined class across all four reference sources
+/// — the same "spans multiple sources, one semantic rule" treatment
+/// [`validate_request`] gives its unknown-id class (agent/task_pattern/
+/// weight/skills_add/skills_remove all collected together, Task 6):
+/// every dangling reference across the whole registry is collected and
+/// reported together in one call, not source-by-source.
+///
+/// The weight-class `"all"` sentinel ([`AllOrList::All`]) is a closed
+/// vocabulary *value* (R1 "open vs. closed vocabularies" note, R2),
+/// never an id to resolve — only [`AllOrList::List`]'s entries are
+/// checked against declared ids. A weight class's `profile_sections` is
+/// never checked here: its entries are profile-internal XML tag names
+/// (R6), not registry-declared ids — matching a tag against the profile
+/// is AC6.1's job, and needs the resolved profile content this IO-free
+/// function never has.
+///
+/// Two other R2 acceptance criteria are deliberately absent from this
+/// function's body:
+/// - **AC2.3** (closed `include` enum) needs no runtime check: `Include`
+///   is already a closed 3-variant enum (Task 1) enforced by
+///   [`parse_registry`] at parse time — an invalid value can never
+///   survive into a live [`Registry`] for this function to inspect, the
+///   same "define errors out of existence" treatment `Tier`/
+///   `PermissionMode` get in [`validate_request`].
+/// - **AC2.1** (an unresolvable file path) is not a self-consistency
+///   property of the registry alone — confirming a path resolves needs
+///   an actual read, which this IO-free function never performs. It's
+///   enforced by [`ContentResolver::resolve`] (native: `dispcli-io`'s
+///   `FsContentResolver`, Task 3) at assembly time.
+///
+/// # Errors
+/// A `config_invalid` [`Error`] carrying one `"field"`/`"value"` detail
+/// pair per dangling reference, collected in patterns → `blocks.order`
+/// → weights order (recoverable via [`Error::all_details`]).
+pub fn validate_registry(registry: &Registry) -> Result<(), Error> {
+    let mut dangling = Vec::new();
+
+    for (pattern_id, pattern) in &registry.patterns {
+        for (i, skill_id) in pattern.skills.iter().enumerate() {
+            if !registry.skills.contains_key(skill_id) {
+                dangling.push((
+                    format!("patterns.{pattern_id}.skills[{i}]"),
+                    skill_id.clone(),
+                ));
+            }
+        }
+    }
+
+    for (i, block_id) in registry.blocks.order.iter().enumerate() {
+        if !registry.blocks.blocks.contains_key(block_id) {
+            dangling.push((format!("blocks.order[{i}]"), block_id.clone()));
+        }
+    }
+
+    for (weight_id, weight) in &registry.weights {
+        if let Some(skills) = &weight.skills {
+            for (i, skill_id) in skills.iter().enumerate() {
+                if !registry.skills.contains_key(skill_id) {
+                    dangling.push((format!("weights.{weight_id}.skills[{i}]"), skill_id.clone()));
+                }
+            }
+        }
+        if let AllOrList::List(block_ids) = &weight.blocks {
+            for (i, block_id) in block_ids.iter().enumerate() {
+                if !registry.blocks.blocks.contains_key(block_id) {
+                    dangling.push((format!("weights.{weight_id}.blocks[{i}]"), block_id.clone()));
+                }
+            }
+        }
+    }
+
+    if !dangling.is_empty() {
+        return Err(class_error(
+            ErrorKind::ConfigInvalid,
+            "registry references one or more undeclared ids",
+            dangling,
         ));
     }
 

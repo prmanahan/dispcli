@@ -81,6 +81,44 @@ fn resolver_reports_resolution_failed_for_missing_file() {
 }
 
 #[test]
+fn resolver_reports_resolution_failed_naming_the_declared_registry_key_and_path() {
+    // R2/AC2.1: "a registry referencing a file that cannot be resolved
+    // fails at assembly time with an error naming the registry key and
+    // the path." Exercises the full chain: a real registry TOML string
+    // (parsed via `dispcli_core::parse_registry`) declares a block whose
+    // file doesn't exist on disk; resolving it through `FsContentResolver`
+    // must name the registry key ("metrics") and the resolved path.
+    let registry_toml = r#"
+[registry]
+skills_root = "skills"
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "skills/dispatch-metrics.md"
+include = "always"
+"#;
+    let registry =
+        dispcli_core::parse_registry(registry_toml).expect("well-formed registry should parse");
+    let block = &registry.blocks.blocks["metrics"];
+
+    let registry_dir = tempfile::tempdir().expect("tempdir should create");
+    let resolver = FsContentResolver::new(registry_dir.path());
+    let err = resolver
+        .resolve("metrics", &block.path)
+        .expect_err("declared file that doesn't exist should fail to resolve");
+
+    let expected_path = registry_dir.path().join("skills/dispatch-metrics.md");
+    assert_eq!(err.kind, ErrorKind::ResolutionFailed);
+    assert_eq!(err.detail("id"), Some("metrics"));
+    assert_eq!(
+        err.detail("path"),
+        Some(expected_path.display().to_string().as_str())
+    );
+}
+
+#[test]
 fn resolver_rejects_absolute_declared_path() {
     // R3: resolution is relative to the registry file's directory.
     // Accepting an absolute path would silently break that contract
