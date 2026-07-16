@@ -35,6 +35,27 @@
 //! dangling reference (not source-by-source). AC2.3 (closed `include`
 //! enum) and AC2.1 (resolvable paths) need no new code here — see
 //! `validate_registry`'s own doc comment for why.
+//!
+//! Task 9 scope: placeholder-substitution completeness (R5 refinements,
+//! standard-weight slice). Three things land together because all three
+//! are the "finish what Task 4 sketched" pass over the same
+//! skill/block-resolution seam: (1) [`resolve_skills`] now performs the
+//! full R5 skill-merge rule — pattern order, then `skills_add` in array
+//! order, deduplicated keeping each id's first occurrence, minus
+//! `skills_remove` (Gap-2, ruled 2026-07-15: "pattern order then
+//! `skills_add`, dedup keeps first occurrence" — not an open question);
+//! (2) [`assemble_standard`] now rejects a document where a *supported*
+//! placeholder (the R5 table) survives substitution in a skill/block
+//! section — `assembly_failed`, not a warning (AC5.2); (3) the same pass
+//! collects brace tokens outside the supported set into
+//! [`AssembledDocument::warnings`] (AC5.3, via the new
+//! [`unsupported_brace_tokens`]) rather than silently leaving them
+//! unremarked. `skills_remove` of a skill absent from the effective set
+//! is a `request_invalid` error (AC5.4, AC1.1 naming rule) — checked in
+//! both [`validate_request`] (request-side pre-flight) and
+//! [`resolve_skills`] (assembly-time defense-in-depth, matching the
+//! existing unknown-agent/unknown-task_pattern precedent from Task 4/6)
+//! via the shared [`absent_skills_remove_entries`] helper.
 
 use std::collections::BTreeMap;
 
@@ -1023,13 +1044,49 @@ fn class_error(
     err
 }
 
+/// R5/AC5.4 — computes which `skills_remove` entries are absent from the
+/// effective (standard-weight) skill set: the pattern's `skills` array
+/// union `skills_add`. "`skills_remove` of a skill not present is a
+/// request error" (AC1.1 naming rule — `"field"`/`"value"` detail pairs,
+/// one per violating instance). Shared by [`validate_request`] (the
+/// request-side pre-flight check, run against `registry.patterns`
+/// directly — no content resolution needed) and [`resolve_skills`]
+/// (assembly-time defense-in-depth, mirroring the existing unknown-
+/// agent/unknown-task_pattern precedent) so the field/value detail
+/// construction — the machine-readable half of the contract, per the
+/// [`Error`] doc comment — can't drift between the two call sites even
+/// though each site's `message` wording is free to differ.
+///
+/// Standard-weight slice only: a weight class's fixed `skills` list
+/// (R6, `[weights.<id>].skills`) bypassing the pattern mapping entirely
+/// is Task 8 territory — this helper is unaware of `request.weight` and
+/// always checks against the *pattern's* skill list, matching
+/// [`resolve_skills`]'s own current standard-weight-only scope. Task 8
+/// will need to revisit both call sites when it wires up the light-
+/// weight bypass.
+fn absent_skills_remove_entries(
+    pattern_skills: &[String],
+    skills_add: &[String],
+    skills_remove: &[String],
+) -> Vec<(String, String)> {
+    skills_remove
+        .iter()
+        .enumerate()
+        .filter(|(_, skill_id)| {
+            !pattern_skills.contains(skill_id) && !skills_add.contains(skill_id)
+        })
+        .map(|(i, skill_id)| (format!("skills_remove[{i}]"), skill_id.clone()))
+        .collect()
+}
+
 /// Validates `request` against `registry` (R1 AC1.1 unknown-id checks +
-/// every R7 request-side rule). Runs each validation class in the order
-/// below, returning the **first** class with any violation — but
-/// reporting **every instance** within that class (R7's no-fail-fast-
-/// within-a-class rule, AC7.2). A caller re-runs this after fixing the
-/// reported class to discover the next one; it does not attempt to
-/// surface every class in a single call.
+/// every R7 request-side rule, plus R5/AC5.4's skills_remove-membership
+/// rule — Task 9). Runs each validation class in the order below,
+/// returning the **first** class with any violation — but reporting
+/// **every instance** within that class (R7's no-fail-fast-within-a-class
+/// rule, AC7.2). A caller re-runs this after fixing the reported class to
+/// discover the next one; it does not attempt to surface every class in
+/// a single call.
 ///
 /// Two R7 rules are deliberately absent from this function's body: the
 /// mode-value and tier-value closed enums are enforced by the type system
@@ -1068,6 +1125,29 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
             "request references one or more unknown registry ids",
             unknown_ids,
         ));
+    }
+
+    // R5/AC5.4 — skills_remove entries not present in the effective skill
+    // set (pattern skills ∪ skills_add) are a request error, same AC1.1
+    // field/value naming convention as the unknown-id class above (Task 9).
+    // `registry.patterns.get` is `Some` here unconditionally in practice —
+    // the unknown-id class above already returned on an unknown
+    // `task_pattern` — but this reads defensively (`if let`, no
+    // `.expect()`) to stay panic-free per the workspace no-panic lint set
+    // rather than assume the invariant holds.
+    if let Some(pattern) = registry.patterns.get(&request.task_pattern) {
+        let absent_removals = absent_skills_remove_entries(
+            &pattern.skills,
+            &request.skills_add,
+            &request.skills_remove,
+        );
+        if !absent_removals.is_empty() {
+            return Err(class_error(
+                ErrorKind::RequestInvalid,
+                "skills_remove references one or more skills not present in the effective skill set",
+                absent_removals,
+            ));
+        }
     }
 
     // R7 — parent_commit / spec_version: 40-char lower-hex when non-null.
@@ -1348,14 +1428,29 @@ pub struct Summary {
 // dispatches on `request.weight` between this function and a future
 // `assemble_light` is that task's seam to add, not this one's.
 //
-// Also out of scope here (see the later tasks that own them): R7
-// request/registry validation (Task 6/7), placeholder-hardening —
-// AC5.2's unresolved-placeholder error and AC5.3's unsupported-brace
-// warnings (Task 9), and the full `Summary`/byte-accounting output
-// contract (Task 5/10). This module only proves the assembly *shape* —
-// envelope-first, fixed body order, `include`-filtered blocks,
-// best-effort placeholder substitution, and the Gap-4 byte accounting —
-// against in-memory `ContentResolver` fakes (AC3.2).
+// Task 9 scope (this section, added on top of Task 4's shape): R5's
+// skill-merge rule — pattern order, then `skills_add`, dedup-keeps-first,
+// minus `skills_remove` (Gap-2, ruled 2026-07-15) — is now
+// `resolve_skills`'s full behavior, not just the pattern slice. AC5.2's
+// unresolved-supported-placeholder assembly error
+// (`check_no_unresolved_placeholders`) and AC5.3's unsupported-brace-
+// token warnings (`unsupported_brace_tokens`) both run on every
+// skill/block section's post-substitution content, inside
+// `assemble_standard`'s loops below.
+//
+// Still out of scope here (see the later tasks that own them): wiring
+// R7 request/registry validation into the CLI pipeline (Task 10/11 —
+// `validate_request`/`validate_registry` exist and this module's own
+// tests call them, but `cmd/dispcli`'s `try_assemble` does not yet), R6
+// weight-class behavior beyond `standard` (Task 8), and the full
+// `Summary` output contract beyond `warnings` (Task 5/10 — this module
+// now produces `AssembledDocument.warnings`, which `cmd/dispcli/main.rs`
+// copies verbatim into `Summary.warnings` as a narrow, sanctioned
+// exception; the rest of `Summary`'s wiring is unchanged). This module
+// proves the assembly *shape* — envelope-first, fixed body order,
+// `include`-filtered blocks, hardened placeholder substitution, and the
+// Gap-4 byte accounting — against in-memory `ContentResolver` fakes
+// (AC3.2).
 // ============================================================================
 
 /// The inter-section separator (Gap-4, resolved 2026-07-15): consecutive
@@ -1381,22 +1476,30 @@ struct Section {
     content: String,
 }
 
-/// The result of [`assemble_standard`] — the joined document plus its
-/// per-section byte accounting (Gap-4). `components` is not yet a
-/// [`SizeSummary`] (no `total_bytes` field, no JSON emission) — building
-/// the full R8 summary from this is Task 5/10's job; this is the
-/// assembly-side seam that task wires the CLI to.
+/// The result of [`assemble_standard`] — the joined document, its
+/// per-section byte accounting (Gap-4), and the AC5.3 unsupported-brace-
+/// token warnings collected across every skill/block section
+/// (`warnings`, Task 9). Not yet a full [`SizeSummary`]/[`Summary`] (no
+/// `total_bytes` field, no JSON emission) — building those from this is
+/// Task 5/10's job; this is the assembly-side seam that task wires the
+/// CLI to. `warnings` is exactly what `cmd/dispcli/main.rs` copies
+/// verbatim into `Summary.warnings` (the narrow Task 9 plumb-through).
 #[derive(Debug)]
 pub struct AssembledDocument {
     pub document: String,
     pub components: Vec<ComponentSize>,
+    pub warnings: Vec<String>,
 }
 
 /// Assembles the standard-weight document body from `sections` in order,
 /// joining consecutive components with [`SECTION_SEPARATOR`] and
 /// attributing each separator's bytes to the *preceding* component
-/// (Gap-4). The last component carries no trailing separator.
-fn join_sections(sections: Vec<Section>) -> AssembledDocument {
+/// (Gap-4). The last component carries no trailing separator. `warnings`
+/// passes through unchanged into the returned [`AssembledDocument`] — the
+/// AC5.3 brace-token scan runs per-section in [`assemble_standard`]
+/// before sections reach this function; joining and byte accounting stay
+/// this function's only concern.
+fn join_sections(sections: Vec<Section>, warnings: Vec<String>) -> AssembledDocument {
     let mut document = String::new();
     let mut components = Vec::with_capacity(sections.len());
     let last_index = sections.len().saturating_sub(1);
@@ -1417,6 +1520,7 @@ fn join_sections(sections: Vec<Section>) -> AssembledDocument {
     AssembledDocument {
         document,
         components,
+        warnings,
     }
 }
 
@@ -1443,18 +1547,37 @@ fn resolve_profile(
     resolver.resolve(agent_id, &agent.profile)
 }
 
-/// Resolves the pattern's skill contents in declared order (R5 step 2,
-/// standard-weight slice: pattern order only — merging in `skills_add`
-/// minus `skills_remove` with dedup-keeps-first is Gap-2, deferred to
-/// Task 9). Returns `request_invalid` for an unknown `task_pattern`
-/// (previews AC1.1, see [`resolve_profile`]) and `config_invalid` for a
-/// pattern skill id with no registry entry (a dangling reference, AC2.2 —
-/// registry-internal, not caller input).
+/// Resolves the effective skill set's contents, in order (R5 step 2,
+/// standard-weight slice, Task 9): the pattern's `skills` array in
+/// declared order, then `request.skills_add` in array order, with a
+/// skill id appearing in both kept at its **first** occurrence only
+/// (dedup-keeps-first — Gap-2, ruled 2026-07-15: "pattern order then
+/// `skills_add`, dedup keeps first occurrence" — pinned, not open), minus
+/// `request.skills_remove`. Weight classes with a fixed `skills` list
+/// bypassing this pattern-based merge entirely (R5) is Task 8 territory —
+/// this function is unaware of `request.weight`.
+///
+/// # Errors
+/// `request_invalid` for an unknown `task_pattern` (previews AC1.1, see
+/// [`resolve_profile`]); `request_invalid` for a `skills_add` entry with
+/// no registry entry (AC1.1 — a request-side problem: the caller named a
+/// skill that doesn't exist, distinct from the pattern-sourced case
+/// below) or a `skills_remove` entry absent from the effective set
+/// (AC5.4 — assembly-time defense-in-depth copy of the same check
+/// [`validate_request`] runs earlier in the pipeline, via the shared
+/// [`absent_skills_remove_entries`] helper so the field/value detail
+/// construction can't drift between the two call sites); `config_invalid`
+/// for a *pattern*-sourced skill id with no registry entry (a dangling
+/// reference, AC2.2 — registry-internal, not caller input; every
+/// `skills_add`-sourced id is validated to exist before the merge below,
+/// so any id the final resolve loop can't find in `registry.skills` must
+/// have come from the pattern).
 fn resolve_skills(
-    task_pattern: &str,
+    request: &DispatchRequest,
     registry: &Registry,
     resolver: &dyn ContentResolver,
 ) -> Result<Vec<(String, String)>, Error> {
+    let task_pattern = request.task_pattern.as_str();
     let pattern = registry.patterns.get(task_pattern).ok_or_else(|| {
         Error::new(
             ErrorKind::RequestInvalid,
@@ -1463,15 +1586,63 @@ fn resolve_skills(
         .with_detail("field", "task_pattern")
         .with_detail("value", task_pattern)
     })?;
-    let mut resolved = Vec::with_capacity(pattern.skills.len());
-    for skill_id in &pattern.skills {
+
+    // AC1.1 defense-in-depth: skills_add referencing an undeclared skill
+    // is a request-side problem, not a registry self-consistency
+    // problem — request_invalid, matching validate_request's own
+    // unknown-id class. Checked ahead of the pattern's own
+    // dangling-reference check in the resolve loop below so a
+    // request-side problem is never misreported as a registry-side one.
+    let mut unknown_skills_add = Vec::new();
+    for (i, skill_id) in request.skills_add.iter().enumerate() {
+        if !registry.skills.contains_key(skill_id) {
+            unknown_skills_add.push((format!("skills_add[{i}]"), skill_id.clone()));
+        }
+    }
+    if !unknown_skills_add.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "skills_add references one or more unknown registry ids",
+            unknown_skills_add,
+        ));
+    }
+
+    let absent_removals =
+        absent_skills_remove_entries(&pattern.skills, &request.skills_add, &request.skills_remove);
+    if !absent_removals.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "skills_remove references one or more skills not present in the effective skill set",
+            absent_removals,
+        ));
+    }
+
+    // Gap-2 merge: pattern order, then skills_add order, first occurrence
+    // wins on a duplicate id.
+    let mut merged_order: Vec<&String> = Vec::new();
+    for skill_id in pattern.skills.iter().chain(request.skills_add.iter()) {
+        if !merged_order.contains(&skill_id) {
+            merged_order.push(skill_id);
+        }
+    }
+    let effective: Vec<&String> = merged_order
+        .into_iter()
+        .filter(|id| !request.skills_remove.contains(*id))
+        .collect();
+
+    let mut resolved = Vec::with_capacity(effective.len());
+    for skill_id in effective {
+        // Every skills_add-sourced id was validated to exist above; any
+        // remaining unresolvable id must have come from the pattern
+        // itself — a registry self-consistency problem (AC2.2), not a
+        // request-side one.
         let skill = registry.skills.get(skill_id).ok_or_else(|| {
             Error::new(
                 ErrorKind::ConfigInvalid,
                 format!("pattern '{task_pattern}' references unknown skill '{skill_id}'"),
             )
             .with_detail("pattern", task_pattern)
-            .with_detail("skill", skill_id)
+            .with_detail("skill", skill_id.clone())
         })?;
         let content = resolver.resolve(skill_id, &skill.path)?;
         resolved.push((skill_id.clone(), content));
@@ -1514,12 +1685,14 @@ fn resolve_blocks(
 
 /// Applies best-effort supported-placeholder substitution (R5 placeholder
 /// table) to skill/template-block content. Substitution is unconditional
-/// text replacement — a placeholder not present in `content` is a no-op,
-/// and (Task 4 scope) a placeholder left unsubstituted is not itself an
-/// error here. AC5.2's "unresolved placeholder is an assembly error" and
-/// AC5.3's "unsupported braces pass through + warn" are placeholder
-/// *hardening*, deferred to Task 9 — this function only performs the
-/// substitution the R5 table names.
+/// text replacement — a placeholder not present in `content` is a no-op.
+/// This function only performs the substitution itself and never fails:
+/// a placeholder left unsubstituted afterward is AC5.2's job to catch
+/// ([`check_no_unresolved_placeholders`], run by [`assemble_standard`] on
+/// this function's output — never inside this function, which stays a
+/// pure best-effort replace with no `Result`/error path of its own).
+/// AC5.3's unsupported-brace-token warnings are likewise a separate pass
+/// over the same output ([`unsupported_brace_tokens`]).
 fn substitute_placeholders(
     content: &str,
     request: &DispatchRequest,
@@ -1539,29 +1712,191 @@ fn substitute_placeholders(
     out
 }
 
+/// The complete set of placeholder tokens with defined substitution
+/// semantics (R5 placeholder table) — checked post-substitution by
+/// [`check_no_unresolved_placeholders`] (AC5.2) and used to exclude a
+/// well-formed placeholder-shaped brace token from
+/// [`unsupported_brace_tokens`]'s AC5.3 scan. A fixed array (not derived
+/// from [`substitute_placeholders`]'s `replace` calls) so a future
+/// placeholder addition to the R5 table forces touching both call sites
+/// in the same review, per G2 (`skills/rust.md` `<guarantee-by-mechanism>`).
+const SUPPORTED_PLACEHOLDERS: [&str; 7] = [
+    "{dispatch_id}",
+    "{task_id}",
+    "{agent_name}",
+    "{project_path}",
+    "{worktree_path}",
+    "{branch}",
+    "{report_path}",
+];
+
+/// AC5.2 — any supported placeholder still present in `content` after
+/// [`substitute_placeholders`] has run is an assembly error, not a
+/// warning (contrast with an *unsupported* brace token, AC5.3, which
+/// warns instead). Only `{task_id}` and `{worktree_path}` can ever
+/// survive in practice — the R5 table substitutes them conditionally,
+/// only when the envelope's corresponding field is non-null; the other
+/// five are always substituted unconditionally
+/// ([`substitute_placeholders`]). This function scans the full
+/// [`SUPPORTED_PLACEHOLDERS`] set rather than special-casing those two,
+/// so it stays correct if a future placeholder gains a conditional
+/// substitution rule too. This is the *intended* AC5.2 failure mode for
+/// an always-included skill/block referencing a null-conditional
+/// placeholder in a dispatch that doesn't supply it (e.g. `{task_id}` in
+/// a no-task dispatch) — not a gap to work around; see the Task 9
+/// dispatch's intentional-gap note.
+///
+/// # Errors
+/// An [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] naming the
+/// offending `section` (the `size.components[].section` name — e.g.
+/// `"skill:verify"`) and `placeholder` (the literal token, e.g.
+/// `"{worktree_path}"`) via `"section"`/`"placeholder"` details. Returns
+/// on the first offending placeholder found — the assembly pipeline
+/// fails fast on resolution/content problems generally (see
+/// [`resolve_profile`]/[`resolve_skills`]/[`resolve_blocks`]), unlike
+/// `validate_request`'s request-side collect-all-in-class rule (R7).
+fn check_no_unresolved_placeholders(section_name: &str, content: &str) -> Result<(), Error> {
+    for placeholder in SUPPORTED_PLACEHOLDERS {
+        if content.contains(placeholder) {
+            return Err(Error::new(
+                ErrorKind::AssemblyFailed,
+                format!(
+                    "supported placeholder '{placeholder}' remains unsubstituted in '{section_name}'"
+                ),
+            )
+            .with_detail("section", section_name)
+            .with_detail("placeholder", placeholder));
+        }
+    }
+    Ok(())
+}
+
+/// True when every byte of `s` is an ASCII identifier character (letter,
+/// digit, or underscore) and `s` is non-empty — the shape of a brace
+/// token's inner text that [`unsupported_brace_tokens`] treats as
+/// "placeholder-shaped" (matching the syntax of every
+/// [`SUPPORTED_PLACEHOLDERS`] entry: `dispatch_id`, `task_id`, ...). A
+/// `{` immediately followed by anything else (whitespace, punctuation) is
+/// presumed incidental prose or code — not a placeholder-shaped token —
+/// and is left alone: scanning for those would false-positive on every
+/// Rust code block, JSON example, or set-notation aside a skill/block
+/// file legitimately contains (R5: "skill content legitimately contains
+/// braces"). This exclusion covers only the *first* brace of a pair:
+/// `{{ghost}}` is not left alone — the outer `{` yields an empty segment
+/// (skipped, no closing `}` found before the next `{`), but the inner `{`
+/// starts a fresh scan that finds `ghost` and warns `{ghost}`. No `{{`
+/// escaping is implemented; that would be a behavior change, not a
+/// documentation fix (Warden review dispatch-1642 F6).
+fn is_placeholder_ident(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// AC5.3 — finds every placeholder-shaped brace token (`{identifier}`,
+/// per [`is_placeholder_ident`]) in `content` that is **not** one of
+/// [`SUPPORTED_PLACEHOLDERS`]. Deduplicated within one call (a token
+/// repeated twice in the same section produces one entry, in first-seen
+/// order) — [`assemble_standard`] deduplicates again across the whole
+/// document when building the summary `warnings` array.
+///
+/// Manual `split`/`find`-based scan rather than a regex dependency — an
+/// anchored fixed-pattern matcher over a small, well-defined token shape
+/// decomposes cleanly into stdlib operations (`skills/rust.md`
+/// `<dependencies>`: "can you exhaustively enumerate the valid inputs in
+/// your head? If yes → manual is fine"). Uses `.get()` range slicing
+/// throughout, never `[]` indexing/slicing — both `string_slice` and
+/// `indexing_slicing` are workspace-lint-denied, and every offset here
+/// (from `find('{')`/`find('}')`) is provably a char boundary in
+/// practice, but `.get()` stays panic-free even if that provability
+/// argument is ever wrong.
+#[must_use]
+pub fn unsupported_brace_tokens(content: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for segment in content.split('{').skip(1) {
+        let Some(close) = segment.find('}') else {
+            continue;
+        };
+        let Some(inner) = segment.get(..close) else {
+            continue;
+        };
+        if !is_placeholder_ident(inner) {
+            continue;
+        }
+        let token = format!("{{{inner}}}");
+        if SUPPORTED_PLACEHOLDERS.contains(&token.as_str()) {
+            continue;
+        }
+        if !found.contains(&token) {
+            found.push(token);
+        }
+    }
+    found
+}
+
+/// Runs [`unsupported_brace_tokens`] over one section's post-substitution
+/// content and appends a warning per distinct token to `warnings` (AC5.3).
+/// Within-section dedup is owned entirely by [`unsupported_brace_tokens`]
+/// (it dedups its own return value before this function ever sees it —
+/// see `unsupported_brace_tokens_deduplicates_within_one_call`); this
+/// function pushes one warning per token unconditionally and does no
+/// dedup of its own. The same odd token recurring in two *different*
+/// sections still gets a distinct warning per section, because the
+/// section name is baked into the message, not because this function
+/// checks for it.
+///
+/// One consequence of not deduping here: if `registry.blocks.order`
+/// lists the same block id twice — undetected by [`validate_registry`],
+/// which checks only dangling references, never duplicates —
+/// [`resolve_blocks`] resolves that block twice, producing two identical
+/// `(block_id, content)` pairs. This function is then called twice with
+/// an identical `section_name`/`content` pair and pushes the identical
+/// warning string twice. That is a symptom of the larger pre-existing
+/// double-emission of the block's *content* on that same path (the two
+/// resolved pairs both flow into `sections`, not just `warnings`) — a
+/// registry-validation gap, not something this function's warning-dedup
+/// should paper over. Out of scope here; tracked as Task 10 territory
+/// (Warden review dispatch-1642 F2).
+fn record_brace_warnings(section_name: &str, content: &str, warnings: &mut Vec<String>) {
+    for token in unsupported_brace_tokens(content) {
+        warnings.push(format!(
+            "unsupported placeholder token '{token}' in '{section_name}' passed through unchanged"
+        ));
+    }
+}
+
 /// Assembles a standard-weight dispatch document (R4 envelope + R5 body)
 /// from `request` and `registry`, resolving profile/skill/block content
 /// via `resolver` — no filesystem access in this crate (AC3.1/AC3.2).
 ///
 /// Body order is exactly envelope → profile → skills → blocks → task body
 /// (AC5.1); the envelope is the first block (AC4.4). Skills are the
-/// pattern's declared order (standard-weight slice of R5 step 2 — see
-/// [`resolve_skills`]); blocks are `blocks.order` filtered by `include`
-/// (R5 step 3, see [`resolve_blocks`]); the task body is
-/// `request.task_body` verbatim, never placeholder-substituted. Skill and
-/// block content gets best-effort supported-placeholder substitution
-/// (R5 placeholder table); the profile and task body do not.
+/// effective set — pattern order, then `skills_add`, dedup-keeps-first,
+/// minus `skills_remove` (R5 step 2, Gap-2 — see [`resolve_skills`]);
+/// blocks are `blocks.order` filtered by `include` (R5 step 3, see
+/// [`resolve_blocks`]); the task body is `request.task_body` verbatim,
+/// never placeholder-substituted. Skill and block content gets
+/// best-effort supported-placeholder substitution (R5 placeholder table,
+/// [`substitute_placeholders`]), then two hardening passes (Task 9): any
+/// supported placeholder still unsubstituted is an assembly error
+/// (AC5.2, [`check_no_unresolved_placeholders`]), and any unsupported
+/// brace token is recorded into the returned
+/// [`AssembledDocument::warnings`] (AC5.3, [`record_brace_warnings`]).
+/// The profile and task body get neither substitution nor these
+/// hardening checks.
 ///
 /// # Errors
 /// A [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] for an
 /// unknown `agent` or `task_pattern` (AC1.1 — same rejection
 /// [`validate_request`] (Task 6) reports earlier in the pipeline, with
-/// the same field/value detail shape); a
+/// the same field/value detail shape) or a `skills_remove` entry absent
+/// from the effective skill set (AC5.4, Task 9); a
 /// [`ConfigInvalid`](ErrorKind::ConfigInvalid) [`Error`] for a dangling
 /// registry reference (AC2.2 — full registry self-consistency validation
-/// is a separate, later task); whatever `resolver.resolve` returns
-/// (typically [`ResolutionFailed`](ErrorKind::ResolutionFailed), AC3.3)
-/// on a content-resolution failure.
+/// is a separate, later task); an
+/// [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] for a
+/// supported placeholder left unsubstituted in a skill/block section
+/// (AC5.2, Task 9); whatever `resolver.resolve` returns (typically
+/// [`ResolutionFailed`](ErrorKind::ResolutionFailed), AC3.3) on a
+/// content-resolution failure.
 pub fn assemble_standard(
     request: &DispatchRequest,
     registry: &Registry,
@@ -1573,6 +1908,7 @@ pub fn assemble_standard(
         name: "envelope".to_string(),
         content: envelope.to_yaml_string(),
     }];
+    let mut warnings: Vec<String> = Vec::new();
 
     let profile_content = resolve_profile(&request.agent, registry, resolver)?;
     sections.push(Section {
@@ -1580,18 +1916,24 @@ pub fn assemble_standard(
         content: profile_content,
     });
 
-    for (skill_id, content) in resolve_skills(&request.task_pattern, registry, resolver)? {
+    for (skill_id, content) in resolve_skills(request, registry, resolver)? {
+        let section_name = format!("skill:{skill_id}");
         let content = substitute_placeholders(&content, request, &envelope);
+        check_no_unresolved_placeholders(&section_name, &content)?;
+        record_brace_warnings(&section_name, &content, &mut warnings);
         sections.push(Section {
-            name: format!("skill:{skill_id}"),
+            name: section_name,
             content,
         });
     }
 
     for (block_id, content) in resolve_blocks(registry, &envelope, resolver)? {
+        let section_name = format!("block:{block_id}");
         let content = substitute_placeholders(&content, request, &envelope);
+        check_no_unresolved_placeholders(&section_name, &content)?;
+        record_brace_warnings(&section_name, &content, &mut warnings);
         sections.push(Section {
-            name: format!("block:{block_id}"),
+            name: section_name,
             content,
         });
     }
@@ -1601,5 +1943,5 @@ pub fn assemble_standard(
         content: request.task_body.clone(),
     });
 
-    Ok(join_sections(sections))
+    Ok(join_sections(sections, warnings))
 }

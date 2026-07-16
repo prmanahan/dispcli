@@ -210,6 +210,9 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
             components: assembled.components,
         },
         verify_recipes: request.envelope.verify.clone(),
-        warnings: Vec::new(),
+        // AC5.3 (spec 0001 Task 9) — unsupported brace-token warnings
+        // `assemble_standard` collected across every skill/block section,
+        // copied verbatim into the R8 summary for operator review.
+        warnings: assembled.warnings,
     })
 }
