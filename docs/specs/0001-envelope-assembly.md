@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 |
+| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 |
 | **Scope** | v0: dispatch-request input schema, registry config, resolver traits, envelope + prompt construction, CLI output contract |
 | **Out of scope** | Worktree execution, cost-metric emission, post-dispatch verification, WASM/plugin frontend (all v1+) |
 
@@ -139,7 +139,7 @@ blocks = "all"
 
 [weights.light]
 profile_sections = ["role", "persona", "command-scope"]  # XML-tagged sections to extract
-skills = ["verify"]                   # fixed skill set — pattern mapping is bypassed
+skills = ["verify"]                   # fixed floor: replaces the pattern's skills array only; skills_add/remove still apply (R5 step 2)
 blocks = ["metrics", "working-dir", "scope-boundaries"]
 ```
 
@@ -231,8 +231,14 @@ The document body after the envelope is assembled in fixed order:
    `skills_add` in array order, minus `skills_remove`; a skill appearing
    more than once is emitted **once at its first occurrence** (dedup keeps
    first position) — gap resolution 2026-07-15, pinning "in registry order".
-   Weight classes with a fixed `skills` list bypass the pattern mapping
-   entirely
+   A weight class with a fixed `skills` list bypasses **the pattern mapping
+   only**: its list replaces the pattern's `skills` array (the first term
+   above), and then `skills_add` and `skills_remove` still apply on top, same
+   dedup-keeps-first. The fixed list is a **floor** (a tunable starting set),
+   not a cap — a `light` dispatch can still be extended via `skills_add`.
+   Clarity pin (2026-07-17): the wording already supported this narrow
+   reading; the pin makes it explicit rather than inferred from "the pattern
+   mapping" naming the first of the three terms.
 3. Template blocks — registry `blocks.order`, filtered by `include` rules
 4. Task body, verbatim
 
@@ -261,8 +267,12 @@ the profile, not the task body). Supported placeholders:
 - AC5.1 — Output section order is exactly envelope → profile → skills →
   blocks → task body for every weight class.
 - AC5.2 — Any `{placeholder}` from the supported set remaining unsubstituted
-  in the final document (e.g. `{worktree_path}` used by an included block in
-  a non-worktree dispatch) is an assembly error, not a warning.
+  in a substituted section — skills or template blocks, per R5's substitution
+  scope (e.g. `{worktree_path}` used by an included block in a non-worktree
+  dispatch) — is an assembly error, not a warning. A supported placeholder
+  left in the profile or task body, which R5 passes through verbatim, is
+  **not** an error and **not** an AC5.3 warning (AC5.3 fires only on
+  unsupported tokens); this silent passthrough is an accepted v0 hole.
 - AC5.3 — Brace tokens outside the supported set are passed through
   untouched (skill content legitimately contains braces) and listed in
   the summary's `warnings` array for operator review.
@@ -306,6 +316,7 @@ within a class).
 |---|---|
 | `parent_commit`, `spec_version` | 40-char lower-hex when non-null. Short SHAs rejected — truncated identity invites reconstruction errors. |
 | `repo`, `worktree`, `report_path` | Absolute paths when non-null. |
+| `branch` | Required, non-empty, and a valid git ref name (`git check-ref-format` semantics): no control characters or spaces, no `..`, no leading `-`, no trailing `.lock`, and none of `~ ^ : ? * [`. `branch` reaches skill/block content verbatim via `{branch}` substitution — downstream of the parse boundary, with no escaping layer — so it is constrained at validation, not escaped at emission. |
 | `verify` entries | Trim whitespace; strip a leading `just ` token; reject empty results; reject any entry containing shell metacharacters (`& \| ; > < \` $ ( ) \n \r`); whitespace-split into recipe + args. dispcli does not confirm the recipe exists (that requires running the target project's tooling) — the summary carries the parsed recipe names so the caller can. |
 | `command_scope_subtract` / `_add` entries | Both `capability` and `reason` required and non-empty. No reason to give means the override should not exist. |
 | Scope globs | Each `touch_scope` / `forbid_scope` entry must compile as a glob pattern. A trailing-slash entry (`path/`) is normalized to `path/**` before emission, mirroring downstream enforcement semantics. **Overlap detection (v0, gap resolution 2026-07-15):** an *identical normalized pattern string* present in both `touch_scope` and `forbid_scope` emits a warning (forbid wins downstream); general glob-intersection over differing patterns is deferred to v1+. |
@@ -316,7 +327,7 @@ within a class).
 
 - AC7.1 — Each rule above has at least one rejection test and one
   acceptance test at the boundary (e.g. 39- and 41-char SHAs, `just check`
-  vs `check`, glob `path/` → `path/**`).
+  vs `check`, glob `path/` → `path/**`, an invalid vs. valid `branch`).
 - AC7.2 — Validation errors identify the field path
   (`envelope.verify[1]`) and the offending value.
 - AC7.3 — Trailing-slash normalization is observable in the emitted
