@@ -56,6 +56,25 @@
 //! [`resolve_skills`] (assembly-time defense-in-depth, matching the
 //! existing unknown-agent/unknown-task_pattern precedent from Task 4/6)
 //! via the shared [`absent_skills_remove_entries`] helper.
+//!
+//! Task 8 scope: R6 weight classes beyond `standard`. [`assemble`] is
+//! the new public seam — it resolves `request.weight` against the
+//! registry and combines three independent axes read off the resolved
+//! `WeightClass`: `profile_sections` (verbatim, or an [`extract_profile_sections`]
+//! span-based extraction of named top-level XML tags, AC6.1 — the
+//! extraction is deliberately NOT an XML parser, since team profiles are
+//! markdown-with-XML, not well-formed single-root XML); `skills` (the
+//! existing pattern-based [`resolve_skills`] merge, or a
+//! [`resolve_fixed_skills`] substitution — maintainer ruling, 2026-07-16:
+//! a weight's fixed `skills` list is a *floor*, replacing only R5 step
+//! 2's pattern-mapping term; `request.skills_add`/`skills_remove` still
+//! apply on top of it, same dedup-keeps-first-occurrence rule); `blocks`
+//! (the existing `include`-filtered [`resolve_blocks`], or
+//! [`resolve_blocks_for_weight`]'s intersection of that filtering with a
+//! weight-declared block list). `assemble_standard` is unchanged —
+//! `assemble` is a new, additional entry point `cmd/dispcli` now calls
+//! instead, and produces byte-identical output to `assemble_standard` for
+//! the trivial `"all"`/`None`/`"all"` weight shape.
 
 use std::collections::BTreeMap;
 
@@ -1045,25 +1064,26 @@ fn class_error(
 }
 
 /// R5/AC5.4 — computes which `skills_remove` entries are absent from the
-/// effective (standard-weight) skill set: the pattern's `skills` array
-/// union `skills_add`. "`skills_remove` of a skill not present is a
-/// request error" (AC1.1 naming rule — `"field"`/`"value"` detail pairs,
-/// one per violating instance). Shared by [`validate_request`] (the
-/// request-side pre-flight check, run against `registry.patterns`
-/// directly — no content resolution needed) and [`resolve_skills`]
-/// (assembly-time defense-in-depth, mirroring the existing unknown-
-/// agent/unknown-task_pattern precedent) so the field/value detail
-/// construction — the machine-readable half of the contract, per the
-/// [`Error`] doc comment — can't drift between the two call sites even
-/// though each site's `message` wording is free to differ.
-///
-/// Standard-weight slice only: a weight class's fixed `skills` list
-/// (R6, `[weights.<id>].skills`) bypassing the pattern mapping entirely
-/// is Task 8 territory — this helper is unaware of `request.weight` and
-/// always checks against the *pattern's* skill list, matching
-/// [`resolve_skills`]'s own current standard-weight-only scope. Task 8
-/// will need to revisit both call sites when it wires up the light-
-/// weight bypass.
+/// **effective base** skill set union `skills_add`: the base is the
+/// weight's fixed `skills` list when it pins one, else the pattern's
+/// `skills` array (R6, R5 step 2; maintainer ruling 2026-07-16 — a fixed
+/// list is a *floor*, replacing only the pattern-mapping term, not the
+/// whole merge). "`skills_remove` of a skill not present is a request
+/// error" (AC1.1 naming rule — `"field"`/`"value"` detail pairs, one per
+/// violating instance). This helper itself is unaware of `request.weight`
+/// or the registry — it just takes whatever base slice its caller already
+/// resolved — so the field/value detail construction, the
+/// machine-readable half of the contract per the [`Error`] doc comment,
+/// can't drift between call sites even though each site's `message`
+/// wording is free to differ. Three call sites: [`validate_request`] (the
+/// request-side pre-flight check — resolves the weight-vs-pattern base
+/// itself, no content resolution needed), [`resolve_skills`]
+/// (assembly-time defense-in-depth for the pattern-based merge — only
+/// ever invoked when the resolved weight has *no* fixed list, so passing
+/// the pattern's own array is always correct there, not merely a
+/// standard-weight simplification), and [`resolve_fixed_skills`]
+/// (assembly-time defense-in-depth for the fixed-list merge, passing the
+/// fixed list as the base).
 fn absent_skills_remove_entries(
     pattern_skills: &[String],
     skills_add: &[String],
@@ -1128,16 +1148,32 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
     }
 
     // R5/AC5.4 — skills_remove entries not present in the effective skill
-    // set (pattern skills ∪ skills_add) are a request error, same AC1.1
-    // field/value naming convention as the unknown-id class above (Task 9).
-    // `registry.patterns.get` is `Some` here unconditionally in practice —
-    // the unknown-id class above already returned on an unknown
-    // `task_pattern` — but this reads defensively (`if let`, no
-    // `.expect()`) to stay panic-free per the workspace no-panic lint set
-    // rather than assume the invariant holds.
-    if let Some(pattern) = registry.patterns.get(&request.task_pattern) {
+    // set (effective base ∪ skills_add) are a request error, same AC1.1
+    // field/value naming convention as the unknown-id class above (Task
+    // 9). The effective base is weight-aware (Task 8, maintainer ruling
+    // 2026-07-16): the weight's fixed `skills` list when it pins one —
+    // a floor that replaces only R5 step 2's pattern-mapping term, not
+    // the whole merge — else the pattern's own array. Both
+    // `registry.weights.get`/`registry.patterns.get` are `Some` here
+    // unconditionally in practice — the unknown-id class above already
+    // returned on an unknown `weight`/`task_pattern` — but this reads
+    // defensively (`and_then`/`if let`, no `.expect()`) to stay panic-free
+    // per the workspace no-panic lint set rather than assume the
+    // invariant holds.
+    let effective_base: Option<&[String]> = match registry
+        .weights
+        .get(&request.weight)
+        .and_then(|weight| weight.skills.as_deref())
+    {
+        Some(fixed) => Some(fixed),
+        None => registry
+            .patterns
+            .get(&request.task_pattern)
+            .map(|pattern| pattern.skills.as_slice()),
+    };
+    if let Some(effective_base) = effective_base {
         let absent_removals = absent_skills_remove_entries(
-            &pattern.skills,
+            effective_base,
             &request.skills_add,
             &request.skills_remove,
         );
@@ -1424,9 +1460,12 @@ pub struct Summary {
 //
 // Task 4 scope: the `standard` weight class only (`profile_sections =
 // "all"`, `blocks = "all"` — R6). Light weight (fixed skill list, XML
-// section extraction) is Task 8; a public `assemble` entry point that
-// dispatches on `request.weight` between this function and a future
-// `assemble_light` is that task's seam to add, not this one's.
+// section extraction) landed in Task 8 as `extract_profile_sections`/
+// `resolve_fixed_skills`/`resolve_blocks_for_weight`, combined by the
+// public `assemble` entry point — see the "R6 — Weight classes (Task 8)"
+// section after this function. `assemble_standard` itself is unchanged:
+// still the direct, standard-weight-only path this task built, still
+// exercised directly by the tests below.
 //
 // Task 9 scope (this section, added on top of Task 4's shape): R5's
 // skill-merge rule — pattern order, then `skills_add`, dedup-keeps-first,
@@ -1441,9 +1480,8 @@ pub struct Summary {
 // Still out of scope here (see the later tasks that own them): wiring
 // R7 request/registry validation into the CLI pipeline (Task 10/11 —
 // `validate_request`/`validate_registry` exist and this module's own
-// tests call them, but `cmd/dispcli`'s `try_assemble` does not yet), R6
-// weight-class behavior beyond `standard` (Task 8), and the full
-// `Summary` output contract beyond `warnings` (Task 5/10 — this module
+// tests call them, but `cmd/dispcli`'s `try_assemble` does not yet), and
+// the full `Summary` output contract beyond `warnings` (Task 5/10 — this module
 // now produces `AssembledDocument.warnings`, which `cmd/dispcli/main.rs`
 // copies verbatim into `Summary.warnings` as a narrow, sanctioned
 // exception; the rest of `Summary`'s wiring is unchanged). This module
@@ -1548,14 +1586,20 @@ fn resolve_profile(
 }
 
 /// Resolves the effective skill set's contents, in order (R5 step 2,
-/// standard-weight slice, Task 9): the pattern's `skills` array in
+/// pattern-mapping term, Task 9): the pattern's `skills` array in
 /// declared order, then `request.skills_add` in array order, with a
 /// skill id appearing in both kept at its **first** occurrence only
 /// (dedup-keeps-first — Gap-2, ruled 2026-07-15: "pattern order then
 /// `skills_add`, dedup keeps first occurrence" — pinned, not open), minus
-/// `request.skills_remove`. Weight classes with a fixed `skills` list
-/// bypassing this pattern-based merge entirely (R5) is Task 8 territory —
-/// this function is unaware of `request.weight`.
+/// `request.skills_remove`. This function is unaware of `request.weight`
+/// by design, not merely by scope: [`assemble`] (Task 8) only calls it
+/// when the resolved weight has **no** fixed `skills` list — a weight
+/// that pins one calls [`resolve_fixed_skills`] instead, which performs
+/// the equivalent merge with the fixed list substituted for the pattern
+/// term (maintainer ruling 2026-07-16: the fixed list is a floor, not a
+/// cap — R6, R5 step 2). `assemble_standard` also calls this function
+/// unconditionally, since it always assembles as the trivial
+/// `"all"`/`None`/`"all"` shape regardless of `request.weight`.
 ///
 /// # Errors
 /// `request_invalid` for an unknown `task_pattern` (previews AC1.1, see
@@ -1655,14 +1699,47 @@ fn resolve_skills(
 /// `worktree` only when `envelope.worktree` is non-null, `task` only when
 /// `envelope.task_id` is non-null. Returns `config_invalid` for a
 /// `blocks.order` entry with no matching `[blocks.<id>]` table (a
-/// dangling reference, AC2.2).
+/// dangling reference, AC2.2). Thin wrapper over
+/// [`resolve_blocks_for_weight`] with no weight-class block list (the
+/// `"all"` sentinel, Task 8) — kept as its own named function since every
+/// Task 4/9 call site already reads `resolve_blocks`.
 fn resolve_blocks(
     registry: &Registry,
     envelope: &Envelope,
     resolver: &dyn ContentResolver,
 ) -> Result<Vec<(String, String)>, Error> {
+    resolve_blocks_for_weight(registry, envelope, resolver, None)
+}
+
+/// The general form behind [`resolve_blocks`] (Task 8, R6): same
+/// `blocks.order` + `include` filtering, additionally intersected with
+/// `allowed` when `Some` — a weight class's explicit `blocks` list (R6:
+/// "a weight `blocks` list intersects with the `include` rules — a
+/// listed block still respects `worktree`/`task` conditions").
+/// `allowed = None` is the `"all"` sentinel: every `include`-satisfying
+/// block, matching [`resolve_blocks`]'s existing behavior exactly.
+/// `blocks.order` stays the sole source of iteration order in both cases;
+/// a weight-listed block id absent from `blocks.order` is simply never
+/// reached here (not a separate error surfaced by this function) — that
+/// dangling-reference case is [`validate_registry`]'s AC2.2 job.
+///
+/// # Errors
+/// A `config_invalid` [`Error`] for a `blocks.order` entry with no
+/// matching `[blocks.<id>]` table (AC2.2); whatever `resolver.resolve`
+/// returns on a content-resolution failure.
+fn resolve_blocks_for_weight(
+    registry: &Registry,
+    envelope: &Envelope,
+    resolver: &dyn ContentResolver,
+    allowed: Option<&[String]>,
+) -> Result<Vec<(String, String)>, Error> {
     let mut resolved = Vec::new();
     for block_id in &registry.blocks.order {
+        if let Some(allowed_ids) = allowed
+            && !allowed_ids.contains(block_id)
+        {
+            continue;
+        }
         let block = registry.blocks.blocks.get(block_id).ok_or_else(|| {
             Error::new(
                 ErrorKind::ConfigInvalid,
@@ -1863,6 +1940,39 @@ fn record_brace_warnings(section_name: &str, content: &str, warnings: &mut Vec<S
     }
 }
 
+/// Applies best-effort placeholder substitution ([`substitute_placeholders`]),
+/// the AC5.2 unresolved-placeholder hardening check
+/// ([`check_no_unresolved_placeholders`]), and AC5.3 unsupported-brace-
+/// token warning collection ([`record_brace_warnings`]) to one skill/
+/// block section's resolved content, then appends the resulting
+/// [`Section`] to `sections`. Shared by [`assemble_standard`] and
+/// [`assemble`] (Task 8) so the per-section pipeline can't drift between
+/// weight classes — extracted here on its third call site (`<maintainability>`
+/// F6, `skills/rust.md`). The profile and task-body sections never go
+/// through this pipeline in either caller (R5: substitution applies only
+/// to skill/block content).
+///
+/// # Errors
+/// Propagates [`check_no_unresolved_placeholders`]'s
+/// [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] (AC5.2).
+fn push_processed_section(
+    sections: &mut Vec<Section>,
+    warnings: &mut Vec<String>,
+    section_name: String,
+    raw_content: &str,
+    request: &DispatchRequest,
+    envelope: &Envelope,
+) -> Result<(), Error> {
+    let content = substitute_placeholders(raw_content, request, envelope);
+    check_no_unresolved_placeholders(&section_name, &content)?;
+    record_brace_warnings(&section_name, &content, warnings);
+    sections.push(Section {
+        name: section_name,
+        content,
+    });
+    Ok(())
+}
+
 /// Assembles a standard-weight dispatch document (R4 envelope + R5 body)
 /// from `request` and `registry`, resolving profile/skill/block content
 /// via `resolver` — no filesystem access in this crate (AC3.1/AC3.2).
@@ -1917,25 +2027,469 @@ pub fn assemble_standard(
     });
 
     for (skill_id, content) in resolve_skills(request, registry, resolver)? {
-        let section_name = format!("skill:{skill_id}");
-        let content = substitute_placeholders(&content, request, &envelope);
-        check_no_unresolved_placeholders(&section_name, &content)?;
-        record_brace_warnings(&section_name, &content, &mut warnings);
-        sections.push(Section {
-            name: section_name,
-            content,
-        });
+        push_processed_section(
+            &mut sections,
+            &mut warnings,
+            format!("skill:{skill_id}"),
+            &content,
+            request,
+            &envelope,
+        )?;
     }
 
     for (block_id, content) in resolve_blocks(registry, &envelope, resolver)? {
-        let section_name = format!("block:{block_id}");
-        let content = substitute_placeholders(&content, request, &envelope);
-        check_no_unresolved_placeholders(&section_name, &content)?;
-        record_brace_warnings(&section_name, &content, &mut warnings);
-        sections.push(Section {
-            name: section_name,
-            content,
-        });
+        push_processed_section(
+            &mut sections,
+            &mut warnings,
+            format!("block:{block_id}"),
+            &content,
+            request,
+            &envelope,
+        )?;
+    }
+
+    sections.push(Section {
+        name: "task_body".to_string(),
+        content: request.task_body.clone(),
+    });
+
+    Ok(join_sections(sections, warnings))
+}
+
+// ============================================================================
+// R6 — Weight classes (Task 8)
+//
+// Non-standard weight classes scale prompt mass without changing
+// assembly order (AC5.1 — the fixed envelope -> profile -> skills ->
+// blocks -> task-body order holds for every weight class, not only
+// "standard"). Three independent axes, each read straight off the
+// resolved `WeightClass` (R2):
+//   - `profile_sections`: `"all"` keeps the profile verbatim (Task 4,
+//     unchanged); a list extracts only the named top-level XML-tagged
+//     sections, in profile order (AC6.1 — see `extract_profile_sections`
+//     below, and its Gap-5 span-based-matching note).
+//   - `skills`: `None` keeps the existing pattern-based merge
+//     (`resolve_skills`, Task 9); `Some(list)` replaces only the
+//     pattern-mapping term of that merge with the fixed list — a floor,
+//     not a cap (maintainer ruling 2026-07-16) — `skills_add`/
+//     `skills_remove` still apply on top of it, same dedup-keeps-first
+//     rule as the pattern-based merge (`resolve_fixed_skills`).
+//   - `blocks`: `"all"` keeps `resolve_blocks`'s existing `include`-
+//     filtered resolution; a list additionally intersects with that
+//     filtering (`resolve_blocks_for_weight`, defined above alongside
+//     `resolve_blocks`).
+//
+// `assemble` is the public seam that resolves `request.weight` against
+// the registry and combines the three axes, sharing
+// `push_processed_section` (defined above, alongside `assemble_standard`)
+// so a weight class's skill/block sections get identical placeholder-
+// substitution and AC5.2/AC5.3 hardening treatment to
+// `assemble_standard`'s. `assemble_standard` is unchanged and still
+// directly callable — `assemble` produces byte-identical output to it
+// when given the trivial `"all"`/`None`/`"all"` weight-class shape (see
+// `assemble_matches_assemble_standard_for_the_trivial_weight_shape` in
+// the integration tests).
+// ============================================================================
+
+/// True when `s` is a valid XML tag name for the purposes of top-level
+/// section matching (AC6.1): starts with an ASCII letter, followed by
+/// ASCII alphanumerics or hyphens — matches every tag name in
+/// `skills/xml-profile.md`'s convention (`role`, `command-scope`,
+/// `error-handling`, ...).
+fn is_tag_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Parses `trimmed` as a bare XML open-tag line (`<name>` alone on the
+/// line — no attributes, no self-close, no trailing prose) — the
+/// one-tag-per-line convention every team profile follows
+/// (`skills/xml-profile.md`). Returns the tag name on match; `None` for a
+/// close tag, a malformed tag, or ordinary prose. Exact-name parsing (not
+/// a prefix/substring match) is what keeps a requested `role` from ever
+/// matching a `<roles>` line.
+fn bare_open_tag(trimmed: &str) -> Option<&str> {
+    let inner = trimmed.strip_prefix('<')?.strip_suffix('>')?;
+    if inner.starts_with('/') || !is_tag_name(inner) {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Parses `trimmed` as a bare XML close-tag line (`</name>` alone on the
+/// line) — the counterpart to [`bare_open_tag`].
+fn bare_close_tag(trimmed: &str) -> Option<&str> {
+    let inner = trimmed.strip_prefix("</")?.strip_suffix('>')?;
+    is_tag_name(inner).then_some(inner)
+}
+
+/// True when `trimmed` is a Markdown fenced-code-block delimiter (three
+/// or more backticks, optionally followed by a language tag — opening
+/// and closing fences look identical here; toggling on every occurrence
+/// is what tracks in/out state). Fenced content is never scanned for tag
+/// lines — the adversarial case this guards is a skill/doc file's own
+/// illustrative ` ```xml `-fenced `<role>...</role>` example (exactly the
+/// shape `skills/xml-profile.md` itself contains): a naive scanner would
+/// misread that example as a genuine top-level section.
+fn is_fence_delimiter(trimmed: &str) -> bool {
+    trimmed.starts_with("```")
+}
+
+/// Finds the line index of the `</name>` that closes the open tag at
+/// line `open_idx`, tracking same-name nesting depth (a `<name>` line
+/// re-appearing before the matching close increments depth; only the
+/// close that brings depth back to 0 is returned), so a pathological
+/// recursive same-name tag still resolves to its true outermost close.
+/// Tags of *other* names nested in between are not tracked here — they
+/// don't affect this tag's own depth; they're simply part of its
+/// verbatim span content. Returns `None` when no matching close is found
+/// before the content ends — an unclosed tag never becomes a recorded
+/// section (see [`find_top_level_sections`]).
+///
+/// Fence-aware, mirroring [`find_top_level_sections`]'s own scan: a line
+/// inside a fenced code block ([`is_fence_delimiter`]) never toggles
+/// `depth`, so a documentation example's illustrative same-name tag line
+/// (e.g. a fenced `<principles>` shown inside `<principles>`'s own
+/// content) can't be mistaken for a real open or close. The scan starts
+/// at `open_idx + 1` with fence-state `false` — the opening tag was
+/// matched by the caller at top level, i.e. outside any fence — so
+/// toggling from there stays in parity with the caller's own fence
+/// tracking.
+fn find_matching_close(lines: &[&str], open_idx: usize, name: &str) -> Option<usize> {
+    let mut depth: i32 = 1;
+    let mut fenced = false;
+    for (idx, line) in lines.iter().enumerate().skip(open_idx + 1) {
+        let trimmed = line.trim();
+        if is_fence_delimiter(trimmed) {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some(n) = bare_open_tag(trimmed) {
+            if n == name {
+                depth += 1;
+            }
+        } else if let Some(n) = bare_close_tag(trimmed)
+            && n == name
+        {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// One top-level XML-tagged span found in profile content (AC6.1): the
+/// tag name and the full verbatim text of the span, from the opening
+/// `<tag>` line through the matching closing `</tag>` line, inclusive.
+struct ProfileSection {
+    tag: String,
+    content: String,
+}
+
+/// Scans `profile` for every **top-level** (outermost-depth) XML-tagged
+/// section, in the order they appear (Gap-5, resolved 2026-07-15:
+/// "top-level" means outermost nesting depth, matched as spans by
+/// line/position — profiles are markdown-with-XML, not well-formed
+/// single-root XML, so this deliberately is NOT an XML parser).
+///
+/// Line-based: a bare `<name>` line opens a candidate section; once its
+/// matching `</name>` is found ([`find_matching_close`]), the whole span
+/// is recorded and the scan jumps to the line after the close — anything
+/// nested inside (e.g. `<error-handling>` inside `<principles>`) is
+/// therefore never independently discovered as a top-level section, only
+/// as part of its parent's verbatim content. A bare `<name>` line with no
+/// matching close is not recorded at all — an unclosed tag is treated as
+/// absent, never as a section, and scanning resumes on the very next
+/// line (so a later, well-formed section is still found). Lines inside a
+/// fenced code block ([`is_fence_delimiter`]) are never treated as tag
+/// lines, so a documentation example inside a ```block can't be mistaken
+/// for a real section.
+fn find_top_level_sections(profile: &str) -> Vec<ProfileSection> {
+    let lines: Vec<&str> = profile.lines().collect();
+    let mut sections = Vec::new();
+    let mut fenced = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        // `i < lines.len()` was just checked, so this is always `Some` —
+        // `.get()` stays panic-free per the workspace no-panic lint set
+        // rather than index directly.
+        let Some(line) = lines.get(i) else {
+            break;
+        };
+        let trimmed = line.trim();
+        if is_fence_delimiter(trimmed) {
+            fenced = !fenced;
+            i += 1;
+            continue;
+        }
+        if fenced {
+            i += 1;
+            continue;
+        }
+        if let Some(name) = bare_open_tag(trimmed)
+            && let Some(close_idx) = find_matching_close(&lines, i, name)
+        {
+            // `i..=close_idx` is always in bounds (close_idx is a valid
+            // index > i found above) — `.get()` + `unwrap_or_default`
+            // keeps this panic-free rather than slicing directly.
+            let span_text = lines
+                .get(i..=close_idx)
+                .map_or_else(String::new, |span| span.join("\n"));
+            sections.push(ProfileSection {
+                tag: name.to_string(),
+                content: span_text,
+            });
+            i = close_idx + 1;
+            continue;
+        }
+        i += 1;
+    }
+    sections
+}
+
+/// AC6.1 — extracts only the top-level XML-tagged sections named in
+/// `tags` from `profile`, joined by [`SECTION_SEPARATOR`], **in profile
+/// order** (not the order `tags` lists them — R6: "in profile order"). A
+/// name in `tags` with no matching top-level span — including a
+/// same-named tag that is only ever nested (never top-level) or one that
+/// opens but never closes — is an `assembly_failed` error naming
+/// `agent_id` and the tag (AC6.1), checked in `tags`' own order so the
+/// reported tag is deterministic when more than one is missing.
+///
+/// # Errors
+/// An [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] carrying
+/// `"agent"`/`"tag"` details for the first name in `tags` absent from
+/// [`find_top_level_sections`]'s scan of `profile`.
+fn extract_profile_sections(
+    agent_id: &str,
+    profile: &str,
+    tags: &[String],
+) -> Result<String, Error> {
+    let found = find_top_level_sections(profile);
+
+    for tag in tags {
+        if !found.iter().any(|s| &s.tag == tag) {
+            return Err(Error::new(
+                ErrorKind::AssemblyFailed,
+                format!(
+                    "weight class section '{tag}' not found in agent '{agent_id}' profile \
+                     (top-level only — a nested-only or unclosed tag does not count)"
+                ),
+            )
+            .with_detail("agent", agent_id)
+            .with_detail("tag", tag));
+        }
+    }
+
+    Ok(found
+        .into_iter()
+        .filter(|s| tags.contains(&s.tag))
+        .map(|s| s.content)
+        .collect::<Vec<_>>()
+        .join(SECTION_SEPARATOR))
+}
+
+/// Resolves a weight class's fixed `skills` list per R5 step 2, with the
+/// fixed list substituted for the *pattern's* array (R6, R5 step 2;
+/// maintainer ruling 2026-07-16 — corrects an earlier implementation of
+/// this function that treated the fixed list as the complete effective
+/// set, ignoring `skills_add`/`skills_remove` entirely; that reading was
+/// overturned). The fixed list is a **floor**, not a cap: the merge is
+/// otherwise identical to [`resolve_skills`]'s pattern-based merge —
+/// fixed-list order first, then `skills_add` in array order, a skill id
+/// appearing in both kept at its **first** occurrence only
+/// (dedup-keeps-first, same rule as Gap-2), minus `skills_remove`.
+///
+/// # Errors
+/// A `request_invalid` [`Error`] for a `skills_add` entry with no
+/// registry entry (AC1.1 — mirrors [`resolve_skills`]'s own check) or a
+/// `skills_remove` entry absent from the effective set (AC5.4 —
+/// assembly-time defense-in-depth copy of the check [`validate_request`]
+/// runs earlier in the pipeline, via the shared
+/// [`absent_skills_remove_entries`] helper); a `config_invalid` [`Error`]
+/// for a listed skill id (from the fixed list) with no registry entry —
+/// a dangling `weights.<id>.skills` reference (AC2.2), matching
+/// [`validate_registry`]'s own classification of the same condition,
+/// applied here as assembly-time defense-in-depth (the same treatment
+/// [`resolve_blocks`]/[`resolve_skills`] give their own dangling-reference
+/// cases); whatever `resolver.resolve` returns on a content-resolution
+/// failure.
+fn resolve_fixed_skills(
+    weight_id: &str,
+    skill_ids: &[String],
+    skills_add: &[String],
+    skills_remove: &[String],
+    registry: &Registry,
+    resolver: &dyn ContentResolver,
+) -> Result<Vec<(String, String)>, Error> {
+    // AC1.1 defense-in-depth: skills_add referencing an undeclared skill
+    // is a request-side problem, not a registry self-consistency
+    // problem — request_invalid, matching resolve_skills's own
+    // unknown-id class. Checked ahead of the fixed list's own
+    // dangling-reference check in the resolve loop below so a
+    // request-side problem is never misreported as a registry-side one.
+    let mut unknown_skills_add = Vec::new();
+    for (i, skill_id) in skills_add.iter().enumerate() {
+        if !registry.skills.contains_key(skill_id) {
+            unknown_skills_add.push((format!("skills_add[{i}]"), skill_id.clone()));
+        }
+    }
+    if !unknown_skills_add.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "skills_add references one or more unknown registry ids",
+            unknown_skills_add,
+        ));
+    }
+
+    let absent_removals = absent_skills_remove_entries(skill_ids, skills_add, skills_remove);
+    if !absent_removals.is_empty() {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "skills_remove references one or more skills not present in the effective skill set",
+            absent_removals,
+        ));
+    }
+
+    // R5 step 2 merge, fixed list substituted for the pattern term: fixed
+    // list order, then skills_add order, first occurrence wins on a
+    // duplicate id (same dedup-keeps-first rule as resolve_skills).
+    let mut merged_order: Vec<&String> = Vec::new();
+    for skill_id in skill_ids.iter().chain(skills_add.iter()) {
+        if !merged_order.contains(&skill_id) {
+            merged_order.push(skill_id);
+        }
+    }
+    let effective: Vec<&String> = merged_order
+        .into_iter()
+        .filter(|id| !skills_remove.contains(*id))
+        .collect();
+
+    let mut resolved = Vec::with_capacity(effective.len());
+    for skill_id in effective {
+        // Every skills_add-sourced id was validated to exist above; any
+        // remaining unresolvable id must have come from the fixed list
+        // itself — a registry self-consistency problem (AC2.2), not a
+        // request-side one.
+        let skill = registry.skills.get(skill_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConfigInvalid,
+                format!("weight '{weight_id}' references unknown skill '{skill_id}'"),
+            )
+            .with_detail("weight", weight_id)
+            .with_detail("skill", skill_id.clone())
+        })?;
+        let content = resolver.resolve(skill_id, &skill.path)?;
+        resolved.push((skill_id.clone(), content));
+    }
+    Ok(resolved)
+}
+
+/// The weight-aware assembly entry point (R6): resolves `request.weight`
+/// against the registry, then assembles envelope -> profile
+/// (section-extracted per the weight's `profile_sections`) -> skills
+/// (fixed list or pattern-based, per the weight's `skills`) -> blocks
+/// (`include`-filtered, optionally intersected with the weight's
+/// `blocks` list) -> task body — the same fixed order
+/// [`assemble_standard`] uses (AC5.1 holds for every weight class).
+/// `cmd/dispcli` calls this, not `assemble_standard` directly, so every
+/// registry-declared weight class (not only `"standard"`) is reachable
+/// from the CLI.
+///
+/// # Errors
+/// A [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] for an
+/// unknown `weight` id (AC1.1 defense-in-depth, same precedent as
+/// [`resolve_profile`]/[`resolve_skills`]'s unknown-agent/task_pattern
+/// checks), a `skills_add`/`skills_remove` problem under either the
+/// pattern-based or fixed-list merge (same AC1.1/AC5.4 rules — see
+/// [`resolve_skills`]/[`resolve_fixed_skills`]), or anything
+/// [`resolve_profile`] itself returns; a
+/// [`ConfigInvalid`](ErrorKind::ConfigInvalid) [`Error`] for a dangling
+/// registry reference — a weight's fixed `skills` entry
+/// ([`resolve_fixed_skills`]) or a `blocks.order`/pattern dangling
+/// reference (same as `assemble_standard`); an
+/// [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] for a weight's
+/// `profile_sections` entry absent from the agent's profile (AC6.1,
+/// [`extract_profile_sections`]) or an unresolved supported placeholder
+/// (AC5.2); whatever `resolver.resolve` returns on a content-resolution
+/// failure.
+pub fn assemble(
+    request: &DispatchRequest,
+    registry: &Registry,
+    resolver: &dyn ContentResolver,
+) -> Result<AssembledDocument, Error> {
+    let weight_id = request.weight.as_str();
+    let weight = registry.weights.get(weight_id).ok_or_else(|| {
+        Error::new(
+            ErrorKind::RequestInvalid,
+            format!("unknown weight '{weight_id}'"),
+        )
+        .with_detail("field", "weight")
+        .with_detail("value", weight_id)
+    })?;
+
+    let envelope = Envelope::from_request(request);
+    let mut sections = vec![Section {
+        name: "envelope".to_string(),
+        content: envelope.to_yaml_string(),
+    }];
+    let mut warnings: Vec<String> = Vec::new();
+
+    let profile_content = resolve_profile(&request.agent, registry, resolver)?;
+    let profile_content = match &weight.profile_sections {
+        AllOrList::All(_) => profile_content,
+        AllOrList::List(tags) => extract_profile_sections(&request.agent, &profile_content, tags)?,
+    };
+    sections.push(Section {
+        name: format!("profile:{}", request.agent),
+        content: profile_content,
+    });
+
+    let skill_pairs = match &weight.skills {
+        Some(fixed) => resolve_fixed_skills(
+            weight_id,
+            fixed,
+            &request.skills_add,
+            &request.skills_remove,
+            registry,
+            resolver,
+        )?,
+        None => resolve_skills(request, registry, resolver)?,
+    };
+    for (skill_id, content) in skill_pairs {
+        push_processed_section(
+            &mut sections,
+            &mut warnings,
+            format!("skill:{skill_id}"),
+            &content,
+            request,
+            &envelope,
+        )?;
+    }
+
+    let allowed_blocks = match &weight.blocks {
+        AllOrList::All(_) => None,
+        AllOrList::List(ids) => Some(ids.as_slice()),
+    };
+    for (block_id, content) in
+        resolve_blocks_for_weight(registry, &envelope, resolver, allowed_blocks)?
+    {
+        push_processed_section(
+            &mut sections,
+            &mut warnings,
+            format!("block:{block_id}"),
+            &content,
+            request,
+            &envelope,
+        )?;
     }
 
     sections.push(Section {

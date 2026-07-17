@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use dispcli_core::{
     AgentEntry, AllOrList, BlockEntry, BlocksSection, ContentResolver, DispatchRequest,
     DocumentSink, Envelope, EnvelopeRequest, Error, ErrorKind, Include, PatternEntry,
-    PermissionMode, Registry, RegistryMeta, ScopeOverride, SkillEntry, Tier, WeightClass,
+    PermissionMode, Registry, RegistryMeta, ScopeOverride, SkillEntry, Tier, WeightClass, assemble,
     assemble_standard, parse_registry, parse_request, parse_verify_entry, scope_overlap_warnings,
     unsupported_brace_tokens, validate_registry, validate_request,
 };
@@ -2284,4 +2284,777 @@ fn warnings_stay_distinct_across_sections() {
             .iter()
             .any(|w| w.contains("block:metrics"))
     );
+}
+
+// ============================================================================
+// Task 8 — R6 weight classes: light-weight profile section extraction
+// (AC6.1), fixed skill lists bypassing the pattern mapping (R6), weight
+// block-list intersection with `include` rules (R6), and the light-vs-
+// standard size delta (AC6.2). Exercises the new `assemble` entry point
+// exclusively — `assemble_standard` (Task 4/9, tests above) is untouched.
+// ============================================================================
+
+/// A profile fixture with four top-level XML-tagged sections (`role`,
+/// `persona`, `principles`, `command-scope`) plus two NESTED-only tags
+/// (`error-handling` inside `principles`, `allowed` inside
+/// `command-scope`) — proves AC6.1's "top-level only" rule: a nested-only
+/// tag must not be extractable even though its name is a genuine XML tag
+/// somewhere in the file.
+const PROFILE_WITH_SECTIONS: &str = "\
+<role>
+Forge — Backend Developer
+</role>
+
+<persona>
+Thinks in types and constraints.
+</persona>
+
+<principles>
+<error-handling>
+- Errors are values, not exceptions to ignore.
+</error-handling>
+</principles>
+
+<command-scope>
+<allowed>
+cargo, git
+</allowed>
+</command-scope>
+";
+
+/// Builds a `[weights.light]`-shaped [`WeightClass`], parameterized by
+/// the three R6 axes so each test below only overrides the one it
+/// exercises.
+fn light_weight(
+    profile_sections: AllOrList,
+    skills: Option<Vec<String>>,
+    blocks: AllOrList,
+) -> WeightClass {
+    WeightClass {
+        profile_sections,
+        skills,
+        blocks,
+    }
+}
+
+/// [`sample_registry`] plus a `"light"` weight class — the common base
+/// for the Task 8 tests, each overriding only the axis it exercises.
+fn registry_with_light(weight: WeightClass) -> Registry {
+    let mut registry = sample_registry();
+    registry.weights.insert("light".to_string(), weight);
+    registry
+}
+
+/// [`full_resolver`] with `team/implementer.md` overridden to
+/// [`PROFILE_WITH_SECTIONS`] — the common resolver for the
+/// section-extraction tests.
+fn resolver_with_sectioned_profile() -> FakeResolver {
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", PROFILE_WITH_SECTIONS);
+    FakeResolver { files }
+}
+
+// ---- AC6.1 — section extraction, in profile order -----------------------
+
+#[test]
+fn assemble_extracts_named_top_level_sections_in_profile_order() {
+    // Weight lists "command-scope" BEFORE "role" — the REVERSE of their
+    // order in PROFILE_WITH_SECTIONS — to prove extraction follows the
+    // profile's order, not the weight class's list order (R6/AC6.1).
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["command-scope".to_string(), "role".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = resolver_with_sectioned_profile();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("assembly should succeed with both requested sections present");
+
+    let role_pos = assembled
+        .document
+        .find("<role>")
+        .expect("role section extracted");
+    let scope_pos = assembled
+        .document
+        .find("<command-scope>")
+        .expect("command-scope section extracted");
+    assert!(
+        role_pos < scope_pos,
+        "AC6.1: extraction order must follow the PROFILE's order (role \
+         before command-scope), not the weight class's list order \
+         (command-scope, role)"
+    );
+    assert!(
+        !assembled.document.contains("<persona>"),
+        "a top-level section not named in profile_sections must not appear"
+    );
+}
+
+#[test]
+fn assemble_treats_nested_only_tag_as_absent_from_the_profile() {
+    // "error-handling" is a genuine XML tag in PROFILE_WITH_SECTIONS, but
+    // only ever nested inside <principles> — never top-level. AC6.1's
+    // outermost-depth rule must treat it as absent, not extract
+    // <principles>'s inner content.
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["error-handling".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = resolver_with_sectioned_profile();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let err = assemble(&request, &registry, &resolver).expect_err(
+        "a tag that only ever appears nested (never top-level) must be treated as absent",
+    );
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("agent"), Some("implementer"));
+    assert_eq!(err.detail("tag"), Some("error-handling"));
+}
+
+#[test]
+fn assemble_reports_missing_profile_section_as_assembly_failed_naming_agent_and_tag() {
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["ghost-section".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = resolver_with_sectioned_profile();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let err = assemble(&request, &registry, &resolver).expect_err(
+        "a section named in the weight class but absent from the profile must fail assembly",
+    );
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("agent"), Some("implementer"));
+    assert_eq!(err.detail("tag"), Some("ghost-section"));
+}
+
+// ---- Adversarial extraction cases (dispatch-mandated coverage) ----------
+
+#[test]
+fn extraction_does_not_treat_a_tag_name_as_a_prefix_match() {
+    // Profile has only <roles> (plural) — no genuine top-level <role>.
+    // Requesting "role" must report it absent, never accidentally match
+    // <roles>'s span via a prefix/substring comparison.
+    let profile = "\
+<roles>
+Not the tag you are looking for.
+</roles>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["role".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let err = assemble(&request, &registry, &resolver)
+        .expect_err("'role' must not match a '<roles>' tag by prefix");
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("tag"), Some("role"));
+}
+
+#[test]
+fn extraction_distinguishes_role_and_roles_when_both_are_present() {
+    let profile = "\
+<role>
+The real role section.
+</role>
+
+<roles>
+A differently-named section that must not be confused with role.
+</roles>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["role".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver).expect(
+        "the genuine <role> tag should be extracted even with a same-prefixed <roles> present",
+    );
+    assert!(assembled.document.contains("The real role section."));
+    assert!(
+        !assembled.document.contains("A differently-named section"),
+        "the unrequested <roles> section must not be included"
+    );
+}
+
+#[test]
+fn extraction_ignores_tags_appearing_inside_a_fenced_code_block() {
+    // A doc-style profile with an illustrative ```xml-fenced example of
+    // <role>...</role> BEFORE its genuine, real <role> section (mirrors
+    // skills/xml-profile.md's own convention-skeleton fence). The fenced
+    // example must not be mistaken for the real section.
+    let profile = "\
+Some intro prose.
+
+```xml
+<role>
+EXAMPLE PLACEHOLDER — not real content.
+</role>
+```
+
+<role>
+Forge — Backend Developer
+</role>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["role".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("the real <role> section outside the fence should be extracted");
+    assert!(
+        assembled.document.contains("Forge — Backend Developer"),
+        "the genuine <role> section must be extracted"
+    );
+    assert!(
+        !assembled.document.contains("EXAMPLE PLACEHOLDER"),
+        "a <role> example inside a fenced code block must not be treated as \
+         the real top-level section"
+    );
+}
+
+#[test]
+fn extraction_treats_an_unclosed_tag_as_absent() {
+    let profile = "\
+<role>
+This role tag is never closed.
+
+<persona>
+A real, properly closed section.
+</persona>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["role".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let err = assemble(&request, &registry, &resolver)
+        .expect_err("an unclosed tag must be treated as absent, not extracted or panicking");
+    assert_eq!(err.kind, ErrorKind::AssemblyFailed);
+    assert_eq!(err.detail("tag"), Some("role"));
+}
+
+#[test]
+fn extraction_still_finds_a_later_properly_closed_section_after_an_earlier_unclosed_tag() {
+    // The unclosed <role> above must not corrupt scanning of what comes
+    // after it — <persona>, closed correctly, should still be found.
+    let profile = "\
+<role>
+This role tag is never closed.
+
+<persona>
+A real, properly closed section.
+</persona>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["persona".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver).expect(
+        "a later well-formed section should still be found despite an earlier unclosed tag",
+    );
+    assert!(
+        assembled
+            .document
+            .contains("A real, properly closed section.")
+    );
+}
+
+#[test]
+fn extraction_close_matching_ignores_a_same_name_tag_inside_a_fenced_block() {
+    // find_matching_close must mirror find_top_level_sections' own fence
+    // awareness. A genuine top-level <principles> section's verbatim
+    // content contains a fenced block whose illustrative example itself
+    // opens with a bare <principles> line — exactly the documentation
+    // shape is_fence_delimiter's own doc comment describes. Without
+    // fence-awareness in find_matching_close, that fenced open drives
+    // depth 1->2, so the real </principles> only returns depth to 1 and
+    // no close is ever found before the content ends — the whole section
+    // reads as unclosed and assembly fails loudly. With the fix, the
+    // fenced line is skipped and the real close is matched, with the
+    // fenced content surviving verbatim inside the extracted span.
+    let profile = "\
+<principles>
+Real guardrail text before the fence.
+
+```text
+<principles>
+Illustrative fenced example — not a real nested section.
+```
+
+Real guardrail text after the fence.
+</principles>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["principles".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver).expect(
+        "a top-level section containing a fenced same-name tag must still be \
+         found and extracted, not misread as unclosed",
+    );
+
+    // Pin the exact span, not just success: the fenced <principles> line
+    // must survive verbatim, bounded by the real open and real close —
+    // a bare .is_ok() would pass even if the span were mis-bounded.
+    let expected_span = "\
+<principles>
+Real guardrail text before the fence.
+
+```text
+<principles>
+Illustrative fenced example — not a real nested section.
+```
+
+Real guardrail text after the fence.
+</principles>";
+    assert!(
+        assembled.document.contains(expected_span),
+        "the extracted <principles> span must be byte-identical from the \
+         real open tag through the real close tag, with the fenced \
+         <principles> line surviving verbatim inside it"
+    );
+}
+
+#[test]
+fn extraction_close_matching_ignores_a_same_name_close_tag_inside_a_fenced_block() {
+    // Companion to the fenced-open case above: a fenced </principles>
+    // line must not be mistaken for the real close either. Without
+    // fence-awareness, that fenced close would drive depth 1->0 early,
+    // truncating the span before the real close — silently dropping
+    // "Real guardrail text after the fence." With the fix, the fenced
+    // close is skipped and the real close (and everything up to it)
+    // survives in the extracted span.
+    let profile = "\
+<principles>
+Real guardrail text before the fence.
+
+```text
+</principles>
+```
+
+Real guardrail text after the fence.
+</principles>
+";
+    let registry = registry_with_light(light_weight(
+        AllOrList::List(vec!["principles".to_string()]),
+        None,
+        AllOrList::All("all".to_string()),
+    ));
+    let mut files = full_resolver().files;
+    files.insert("team/implementer.md", profile);
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver).expect(
+        "a top-level section containing a fenced same-name close tag must \
+         still extract through to its real close",
+    );
+
+    let expected_span = "\
+<principles>
+Real guardrail text before the fence.
+
+```text
+</principles>
+```
+
+Real guardrail text after the fence.
+</principles>";
+    assert!(
+        assembled.document.contains(expected_span),
+        "the extracted <principles> span must reach the real close tag, \
+         not truncate early at the fenced </principles> line"
+    );
+}
+
+// ---- R6 — fixed skills list is a floor, not a cap (maintainer ruling ------
+// ---- 2026-07-16) -----------------------------------------------------
+
+#[test]
+fn assemble_fixed_skills_list_replaces_only_the_pattern_mapping_term() {
+    // The "implementation" pattern's skills are ["verify", "rust"] (see
+    // sample_registry) — the weight's fixed list deliberately picks the
+    // OPPOSITE order, ["rust", "verify"], so the exact-vector assertion
+    // below pins that a fixed list REPLACES the pattern's own array (both
+    // membership and order) as R5 step 2's pattern-mapping term.
+    //
+    // This test does NOT exercise skills_add/skills_remove — the
+    // maintainer's 2026-07-16 ruling overturned an earlier reading of
+    // this function that also ignored those two fields entirely (a fixed
+    // list treated as the complete effective set). The ruling: the fixed
+    // list is a FLOOR, not a cap — R5 step 2's other two terms still
+    // apply on top of it. See the merge tests below for skills_add/
+    // skills_remove coverage; this test isolates the narrower claim (the
+    // fixed list, not the pattern's array, is the merge's base term).
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["rust".to_string(), "verify".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("fixed-skill weight should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:rust", "skill:verify"],
+        "a fixed skills list is the merge's base term IN LISTED ORDER \
+         (rust before verify — the reverse of the pattern's own order) — \
+         the pattern mapping's own array and order play no part when a \
+         weight pins a fixed list"
+    );
+}
+
+#[test]
+fn assemble_light_weight_appends_skills_add_on_top_of_the_fixed_list() {
+    // The maintainer's own worked example from the 2026-07-16 ruling:
+    // "if you ask for light and then also add rust, that is what should
+    // happen." The fixed list ["verify"] is a FLOOR, not the complete
+    // effective set — skills_add still appends "rust" on top of it. The
+    // overturned (whole-merge-bypass) reading would silently drop "rust"
+    // and leave just ["verify"]; this test fails under that reading.
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["verify".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.skills_add = vec!["rust".to_string()];
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("skills_add on top of a fixed list should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:verify", "skill:rust"],
+        "a weight's fixed skills list is a FLOOR, not a cap — skills_add \
+         still appends on top of it (maintainer ruling 2026-07-16): \
+         result must be exactly [verify, rust], not [verify] alone"
+    );
+}
+
+#[test]
+fn assemble_light_weight_dedups_skills_add_entry_already_in_the_fixed_list() {
+    // "verify" is already in the fixed list at position 0 — re-naming it
+    // via skills_add must not duplicate it or move it; dedup keeps the
+    // FIRST occurrence (the fixed-list position), same rule as the
+    // pattern-based merge's Gap-2 dedup.
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["verify".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.skills_add = vec!["verify".to_string(), "rust".to_string()];
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("skills_add merge on top of a fixed list should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:verify", "skill:rust"],
+        "a skills_add entry already present in the fixed list must not be \
+         duplicated — dedup keeps the fixed list's first occurrence"
+    );
+    assert_eq!(
+        assembled.document.matches("VERIFY SKILL CONTENT").count(),
+        1,
+        "a skill present via both the fixed list and skills_add must be \
+         included exactly once"
+    );
+}
+
+#[test]
+fn validate_request_accepts_skills_remove_of_a_fixed_list_member_under_a_weight() {
+    // Regression test for the bug the maintainer's ruling exposed:
+    // `validate_request` used to check `skills_remove` membership only
+    // against the *pattern's* skills (["verify", "rust"] for
+    // "implementation" — see sample_registry), regardless of
+    // `request.weight`. "tdd" is a real registry skill, pinned into the
+    // "light" weight's fixed list, but is NOT part of the
+    // "implementation" pattern's own array nor skills_add — so the old
+    // check would find it absent from its (wrong) base and reject a
+    // request that the narrow ruling says is legitimate: the tool
+    // refusing a request it can satisfy.
+    let mut registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["verify".to_string(), "tdd".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    registry.skills.insert(
+        "tdd".to_string(),
+        SkillEntry {
+            path: "skills/tdd.md".to_string(),
+        },
+    );
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.skills_remove = vec!["tdd".to_string()];
+
+    validate_request(&request, &registry)
+        .expect("skills_remove of a weight's own fixed-list member must be accepted, not rejected");
+}
+
+#[test]
+fn assemble_light_weight_honors_skills_remove_of_a_fixed_list_member() {
+    // Assembly-time counterpart to the validate_request test above —
+    // proves the removal actually takes effect at assembly time, not
+    // just that validation lets the request through.
+    let mut registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["verify".to_string(), "tdd".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    registry.skills.insert(
+        "tdd".to_string(),
+        SkillEntry {
+            path: "skills/tdd.md".to_string(),
+        },
+    );
+    let mut files = full_resolver().files;
+    files.insert("skills/tdd.md", "TDD SKILL CONTENT");
+    let resolver = FakeResolver { files };
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.skills_remove = vec!["tdd".to_string()];
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("removing a fixed-list member via skills_remove should assemble cleanly");
+
+    let skill_sections: Vec<&str> = assembled
+        .components
+        .iter()
+        .map(|c| c.section.as_str())
+        .filter(|s| s.starts_with("skill:"))
+        .collect();
+    assert_eq!(
+        skill_sections,
+        vec!["skill:verify"],
+        "skills_remove must drop a fixed-list member from the effective set"
+    );
+    assert!(!assembled.document.contains("TDD SKILL CONTENT"));
+}
+
+#[test]
+fn assemble_reports_dangling_fixed_skill_as_config_invalid() {
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        Some(vec!["ghost-skill".to_string()]),
+        AllOrList::All("all".to_string()),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+
+    let err = assemble(&request, &registry, &resolver)
+        .expect_err("a fixed-skill list referencing an undeclared skill should fail assembly");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(err.detail("weight"), Some("light"));
+    assert_eq!(err.detail("skill"), Some("ghost-skill"));
+}
+
+// ---- R6 — weight block list intersects with `include` rules --------------
+
+#[test]
+fn assemble_block_list_still_respects_worktree_condition_in_non_worktree_dispatch() {
+    // Weight lists BOTH "metrics" (always) and "merge-msg" (worktree) —
+    // R6: "a weight blocks list intersects with the include rules (a
+    // listed block still respects worktree/task conditions)". A
+    // non-worktree dispatch must still drop merge-msg even though it's
+    // explicitly named in the weight's block list.
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        None,
+        AllOrList::List(vec!["metrics".to_string(), "merge-msg".to_string()]),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.envelope.worktree = None;
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("block-list weight should assemble cleanly in a non-worktree dispatch");
+
+    assert!(assembled.document.contains("METRICS BLOCK CONTENT"));
+    assert!(
+        !assembled.document.contains("MERGE MSG BLOCK CONTENT"),
+        "a worktree-conditioned block named in the weight's block list must \
+         still be dropped when the dispatch has no worktree — intersection, \
+         not replacement, of the include rules"
+    );
+}
+
+#[test]
+fn assemble_block_list_excludes_a_block_not_named_even_when_include_condition_is_satisfied() {
+    // The other half of "intersects": "task-tracking" satisfies its
+    // include=task condition (task_id is set) but is NOT in the weight's
+    // block list — it must still be excluded.
+    let registry = registry_with_light(light_weight(
+        AllOrList::All("all".to_string()),
+        None,
+        AllOrList::List(vec!["metrics".to_string()]),
+    ));
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "light".to_string();
+    request.envelope.task_id = Some(7);
+
+    let assembled = assemble(&request, &registry, &resolver)
+        .expect("block-list weight should assemble cleanly");
+
+    assert!(assembled.document.contains("METRICS BLOCK CONTENT"));
+    assert!(
+        !assembled.document.contains("TASK TRACKING BLOCK CONTENT"),
+        "a block satisfying its include condition but absent from the \
+         weight's block list must still be excluded"
+    );
+}
+
+// ---- AC6.2 — light-vs-standard size delta is observable -------------------
+
+#[test]
+fn light_dispatch_produces_a_smaller_document_than_standard() {
+    let mut registry = sample_registry();
+    registry.weights.insert(
+        "light".to_string(),
+        light_weight(
+            AllOrList::List(vec!["role".to_string()]),
+            Some(vec!["verify".to_string()]),
+            AllOrList::List(vec!["metrics".to_string()]),
+        ),
+    );
+    let resolver = resolver_with_sectioned_profile();
+
+    let mut standard_request = sample_request();
+    standard_request.weight = "standard".to_string();
+    let standard = assemble(&standard_request, &registry, &resolver)
+        .expect("standard weight should assemble cleanly");
+
+    let mut light_request = sample_request();
+    light_request.weight = "light".to_string();
+    let light = assemble(&light_request, &registry, &resolver)
+        .expect("light weight should assemble cleanly");
+
+    let standard_bytes: u64 = standard.components.iter().map(|c| c.bytes).sum();
+    let light_bytes: u64 = light.components.iter().map(|c| c.bytes).sum();
+    assert!(
+        light_bytes < standard_bytes,
+        "AC6.2: a light dispatch must be observably smaller than standard \
+         in the reported size accounting — standard={standard_bytes} light={light_bytes}"
+    );
+    // AC6.2's other half: the summary (Summary.weight, wired in
+    // cmd/dispcli/main.rs) reports which weight class applied — proven at
+    // the `dispcli-core` layer by the `request.weight` field the caller
+    // already echoes verbatim; not re-tested here since that plumbing
+    // predates Task 8 and is unchanged by it.
+}
+
+// ---- Defense-in-depth + equivalence with assemble_standard ----------------
+
+#[test]
+fn assemble_reports_unknown_weight_as_request_invalid() {
+    let registry = sample_registry();
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "ghost-weight".to_string();
+
+    let err = assemble(&request, &registry, &resolver)
+        .expect_err("an unknown weight id should fail assembly");
+    assert_eq!(err.kind, ErrorKind::RequestInvalid);
+    assert_eq!(err.detail("field"), Some("weight"));
+    assert_eq!(err.detail("value"), Some("ghost-weight"));
+}
+
+#[test]
+fn assemble_matches_assemble_standard_for_the_trivial_weight_shape() {
+    // The generalized `assemble` seam must be a strict superset of
+    // `assemble_standard`'s behavior: given the literal
+    // `"all"`/`None`/`"all"` weight-class shape (`sample_registry`'s
+    // "standard" weight), output must be byte-identical.
+    let registry = sample_registry();
+    let resolver = full_resolver();
+    let mut request = sample_request();
+    request.weight = "standard".to_string();
+
+    let via_assemble = assemble(&request, &registry, &resolver)
+        .expect("assemble should succeed for the standard shape");
+    let via_assemble_standard = assemble_standard(&request, &registry, &resolver)
+        .expect("assemble_standard should succeed");
+
+    assert_eq!(via_assemble.document, via_assemble_standard.document);
+    assert_eq!(via_assemble.components, via_assemble_standard.components);
+    assert_eq!(via_assemble.warnings, via_assemble_standard.warnings);
 }

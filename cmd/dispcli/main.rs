@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use dispcli_core::{
-    DocumentSink, Error, ErrorKind, SizeSummary, Summary, WorktreeSummary, assemble_standard,
+    DocumentSink, Error, ErrorKind, SizeSummary, Summary, WorktreeSummary, assemble,
     parse_registry, parse_request,
 };
 use dispcli_io::{FsContentResolver, FsDocumentSink};
@@ -152,9 +152,9 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
         .unwrap_or_else(|| Path::new("."));
     let resolver = FsContentResolver::new(registry_dir);
 
-    let assembled = assemble_standard(&request, &registry, &resolver)?;
+    let assembled = assemble(&request, &registry, &resolver)?;
 
-    // assemble_standard already validated `request.agent` exists in the
+    // assemble already validated `request.agent` exists in the
     // registry (it would have returned request_invalid otherwise), so this
     // lookup succeeding is not a fresh assumption — the AssemblyFailed
     // fallback is defensive, not an expected path.
@@ -211,8 +211,8 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
         },
         verify_recipes: request.envelope.verify.clone(),
         // AC5.3 (spec 0001 Task 9) — unsupported brace-token warnings
-        // `assemble_standard` collected across every skill/block section,
-        // copied verbatim into the R8 summary for operator review.
+        // `assemble` collected across every skill/block section, copied
+        // verbatim into the R8 summary for operator review.
         warnings: assembled.warnings,
     })
 }

@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "light",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: compare standard vs light assembly sizes (Task 8, AC6.2).",
+  "envelope": {
+    "dispatch_id": 42,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": null,
+    "branch": "feature-t8-light",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

@@ -1,0 +1,36 @@
+# Light-weight fixture registry (Task 8, spec 0001 R6).
+#
+# Self-contained (does not share files with tests/fixtures/happy/) so
+# this fixture can never perturb the happy-path golden byte comparison.
+# Declares both "standard" and "light" weight classes over the SAME
+# agent/skill/block declarations, differing only in `profile_sections` —
+# isolates the AC6.2 size-delta proof to profile section extraction.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"
+
+[weights.light]
+profile_sections = ["role"]
+blocks = "all"

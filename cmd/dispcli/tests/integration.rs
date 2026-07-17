@@ -333,3 +333,95 @@ fn malformed_request_json_reports_request_invalid_error() {
         "error.details must be an array"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Task 8 — R6 weight classes, end-to-end through the CLI.
+//
+// Fixtures live under `tests/fixtures/light/` — a self-contained registry
+// declaring both `standard` and `light` weight classes over the same
+// agent/skill/block declarations, differing only in `profile_sections`
+// (light restricts to `["role"]`, excluding a `<persona>` section the
+// standard weight includes verbatim). Deliberately separate from
+// `happy/` so this fixture can never perturb the happy-path golden byte
+// comparison.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Scenario: a `light` weight dispatch reports a smaller size in the R8
+/// summary than the same fixture assembled at `standard` weight.
+///
+/// Given a registry declaring both a `standard` and a `light` weight
+/// class (light restricting `profile_sections` to `["role"]`)
+/// When `dispcli assemble` runs against the same fixture profile/skill/
+/// block content, once per weight
+/// Then both invocations succeed, each summary reports its applied
+/// `weight` verbatim, and the light dispatch's `size.total_bytes` is
+/// strictly smaller than the standard dispatch's. *(AC6.2 — "the summary
+/// reports which weight class applied and the resulting component
+/// sizes... so the operator can confirm a light dispatch actually came
+/// out light")*
+#[test]
+fn light_weight_dispatch_reports_a_smaller_summary_size_than_standard() {
+    let standard_tempdir = tempfile::tempdir().expect("tempdir");
+    let standard_out = standard_tempdir.path().join("standard.md");
+    let standard_output = Command::cargo_bin("dispcli")
+        .unwrap()
+        .arg("assemble")
+        .arg("--request")
+        .arg(fixture("light/request-standard.json"))
+        .arg("--config")
+        .arg(fixture("light/registry.toml"))
+        .arg("--out")
+        .arg(&standard_out)
+        .output()
+        .expect("binary failed to execute");
+    assert!(
+        standard_output.status.success(),
+        "standard-weight assemble exited non-zero. stdout={} stderr={}",
+        String::from_utf8_lossy(&standard_output.stdout),
+        String::from_utf8_lossy(&standard_output.stderr)
+    );
+    let standard_stdout = String::from_utf8(standard_output.stdout).expect("stdout was not utf-8");
+    let standard_summary: Value = serde_json::from_str(standard_stdout.trim())
+        .unwrap_or_else(|e| panic!("standard stdout was not a single JSON object: {e}"));
+    assert_eq!(standard_summary["weight"], "standard");
+
+    let light_tempdir = tempfile::tempdir().expect("tempdir");
+    let light_out = light_tempdir.path().join("light.md");
+    let light_output = Command::cargo_bin("dispcli")
+        .unwrap()
+        .arg("assemble")
+        .arg("--request")
+        .arg(fixture("light/request-light.json"))
+        .arg("--config")
+        .arg(fixture("light/registry.toml"))
+        .arg("--out")
+        .arg(&light_out)
+        .output()
+        .expect("binary failed to execute");
+    assert!(
+        light_output.status.success(),
+        "light-weight assemble exited non-zero. stdout={} stderr={}",
+        String::from_utf8_lossy(&light_output.stdout),
+        String::from_utf8_lossy(&light_output.stderr)
+    );
+    let light_stdout = String::from_utf8(light_output.stdout).expect("stdout was not utf-8");
+    let light_summary: Value = serde_json::from_str(light_stdout.trim())
+        .unwrap_or_else(|e| panic!("light stdout was not a single JSON object: {e}"));
+    assert_eq!(
+        light_summary["weight"], "light",
+        "AC6.2: the summary must report which weight class applied"
+    );
+
+    let standard_bytes = standard_summary["size"]["total_bytes"]
+        .as_u64()
+        .expect("standard size.total_bytes must be an integer");
+    let light_bytes = light_summary["size"]["total_bytes"]
+        .as_u64()
+        .expect("light size.total_bytes must be an integer");
+    assert!(
+        light_bytes < standard_bytes,
+        "AC6.2: a light dispatch must be observably smaller than standard \
+         in the R8 summary's size accounting — standard={standard_bytes} \
+         light={light_bytes}"
+    );
+}
