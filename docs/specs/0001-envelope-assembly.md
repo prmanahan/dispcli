@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 · Amended (AC6.3 weight-class block reachability) — 2026-07-18 · Amended (R7 `branch` scope — enumerated subset, not ref-format parity) — 2026-07-18 |
+| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 · Amended (AC6.3 weight-class block reachability) — 2026-07-18 · Amended (R7 `branch` scope — enumerated subset, not ref-format parity) — 2026-07-18 · Amended (AC6.4 — every declared block must be ordered) — 2026-07-18 |
 | **Scope** | v0: dispatch-request input schema, registry config, resolver traits, envelope + prompt construction, CLI output contract |
 | **Out of scope** | Worktree execution, cost-metric emission, post-dispatch verification, WASM/plugin frontend (all v1+) |
 
@@ -317,6 +317,26 @@ order. The registry defines them (R2); the request selects one.
   `profile_sections` tag named in the weight class but absent from the
   profile — both are weight-class references to something unreachable,
   and both fail loudly rather than silently.
+- AC6.4 — **Every declared `[blocks.<id>]` table must appear in
+  `blocks.order`.** A declared block absent from `order` is unreachable —
+  `blocks.order` is the sole source of iteration order — and is a config
+  error naming the unreachable id. **This generalizes AC6.3** (amendment
+  2026-07-18): AC6.3 catches only the sub-case where a weight class *names*
+  the unreachable block, so a block that is declared and ordered nowhere
+  stayed silently dead config whenever no weight referenced it — the same
+  "declared but unreachable" class, one level out. **Reporting — every
+  instance together, no masking.** An AC6.4 violation is reported in the
+  **same combined `config_invalid` class** as AC2.2's dangling instances and
+  AC6.3's unreachable ones, distinguished by a per-instance `reason` detail
+  (`"undeclared"` / `"unreachable"` / `"orphan"`). Do **not** give AC6.4 its
+  own `Err` class, and do **not** suppress it when a reference-based
+  violation is also present. Rationale, established empirically (Task 10,
+  dispatch 1720): `validate_registry` scans the whole registry regardless of
+  which weight the request names, and a registry may co-declare several
+  defect shapes at once — so any priority-ordered split lets one class mask
+  another, and masking regresses whichever pinned error payload lost. A
+  class-level `message` cannot carry the distinction; per-instance tagging
+  can, and keeps every violation visible to the operator in one pass.
 
 ## R7 — Validation rules
 
