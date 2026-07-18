@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 |
+| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 · Amended (AC6.3 weight-class block reachability) — 2026-07-18 |
 | **Scope** | v0: dispatch-request input schema, registry config, resolver traits, envelope + prompt construction, CLI output contract |
 | **Out of scope** | Worktree execution, cost-metric emission, post-dispatch verification, WASM/plugin frontend (all v1+) |
 
@@ -291,7 +291,10 @@ order. The registry defines them (R2); the request selects one.
   the profile, in profile order.
 - `blocks = "all"` applies the registry `include` rules; a block list
   intersects with those rules (a listed block still respects `worktree`/
-  `task` conditions).
+  `task` conditions). Every id in a block list must also appear in
+  `blocks.order` (amendment 2026-07-18): `blocks.order` is the sole source
+  of iteration order, so a listed-but-unordered block is unreachable —
+  silently dropped rather than assembled.
 
 **Acceptance criteria**
 
@@ -305,6 +308,15 @@ order. The registry defines them (R2); the request selects one.
 - AC6.2 — The summary reports which weight class applied and the resulting
   component sizes (R8), so the operator can confirm a light dispatch
   actually came out light.
+- AC6.3 — A block id named in a weight class's `blocks` list but absent
+  from `blocks.order` is a config error naming the weight class and the
+  unreachable id. **Declaration is not sufficient** (amendment
+  2026-07-18): a `[blocks.<id>]` table satisfies AC2.2's declaration
+  requirement while still being unreachable if `order` omits it, so AC2.2
+  does not cover this case. Mirrors AC6.1's treatment of a
+  `profile_sections` tag named in the weight class but absent from the
+  profile — both are weight-class references to something unreachable,
+  and both fail loudly rather than silently.
 
 ## R7 — Validation rules
 
