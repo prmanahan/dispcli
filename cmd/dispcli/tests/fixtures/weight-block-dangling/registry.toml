@@ -1,0 +1,73 @@
+# Weight-class block-reachability fixture (Task 10 red phase, spec 0001
+# R2 AC2.2 + R6/AC6.3 — the `validate_registry` tripwire, plus its AC6.3
+# sibling).
+#
+# Two DISTINCT shapes live in this file, on purpose — they exercise
+# different branches of `validate_registry` and must NOT be collapsed into
+# one fixture:
+#
+# 1. `weights.ghost-block` names a block id ("nonexistent-block") with NO
+#    `[blocks.nonexistent-block]` table anywhere in this registry — a true
+#    dangling reference, AC2.2's territory. This is the ONLY registry-
+#    self-consistency defense left unguarded by any assembly-time code
+#    path: `resolve_blocks_for_weight` only ever iterates `blocks.order`,
+#    so an id absent from `blocks.order` (whether declared elsewhere or
+#    not) is silently skipped — never reached, never resolved, never
+#    errors. (`resolve_fixed_skills`, the `weights.<id>.skills` sibling
+#    case, DOES have independent defense-in-depth via
+#    `registry.skills.get(...)`, so a dangling `weights.<id>.skills` entry
+#    is NOT a valid tripwire — only the blocks case is.) `validate_registry`
+#    is therefore the *only* code path that can ever produce
+#    `config_invalid` for this exact shape — this is the tripwire test.
+#
+# 2. `weights.ghost-block-ordered` names a block id ("declared-not-ordered")
+#    that DOES have a `[blocks.declared-not-ordered]` table — satisfying
+#    AC2.2's declaration requirement — but that id is absent from
+#    `blocks.order`, so it's unreachable regardless. This is AC6.3's
+#    territory (spec amendment 2026-07-18, ratified in commit b2f1627):
+#    "Declaration is not sufficient... a `[blocks.<id>]` table satisfies
+#    AC2.2's declaration requirement while still being unreachable if
+#    `order` omits it, so AC2.2 does not cover this case." Formerly the
+#    dispatch's open-question carve-out (this comment used to say the
+#    governing amendment hadn't landed yet — it has); this shape is now
+#    covered by
+#    `weight_class_block_declared_but_absent_from_order_is_rejected_as_config_invalid_per_ac6_3`
+#    in `cmd/dispcli/tests/integration.rs`.
+#
+# Both must independently produce `config_invalid` once `validate_registry`
+# is wired into `try_assemble` — neither shape substitutes for the other,
+# and the AC2.2 tripwire's specific value (no other code path can satisfy
+# it) must survive this fixture growing a second scenario.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[blocks.declared-not-ordered]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.ghost-block]
+profile_sections = "all"
+blocks = ["nonexistent-block"]
+
+[weights.ghost-block-ordered]
+profile_sections = "all"
+blocks = ["declared-not-ordered"]

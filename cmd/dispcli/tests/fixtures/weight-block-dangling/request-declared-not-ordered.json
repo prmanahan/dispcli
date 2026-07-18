@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "ghost-block-ordered",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: weights.ghost-block-ordered.blocks references a block id that IS declared as [blocks.<id>] but is absent from blocks.order -> unreachable, must be rejected as config_invalid per AC6.3 (declaration is not sufficient).",
+  "envelope": {
+    "dispatch_id": 602,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": null,
+    "branch": "feature-t10-declared-not-ordered",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

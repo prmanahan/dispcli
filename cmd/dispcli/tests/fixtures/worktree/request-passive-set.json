@@ -1,0 +1,27 @@
+{
+  "agent": "implementer-passive",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "standard",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: worktree_required=false, envelope.worktree=set -> required must still be false (AND, not OR/is_some-alone).",
+  "envelope": {
+    "dispatch_id": 503,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": "/fixtures/repo/.worktrees/feature-t10-wt-passive",
+    "branch": "feature-t10-wt-passive",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

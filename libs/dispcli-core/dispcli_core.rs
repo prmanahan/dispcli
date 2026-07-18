@@ -75,6 +75,25 @@
 //! `assemble` is a new, additional entry point `cmd/dispcli` now calls
 //! instead, and produces byte-identical output to `assemble_standard` for
 //! the trivial `"all"`/`None`/`"all"` weight shape.
+//!
+//! Task 10 scope: R8 output-contract/error-taxonomy completeness. (1)
+//! [`validate_request`] gains the R7 `branch` rule ([`is_valid_branch`]) —
+//! net-new rule implementation, not wiring: no branch check existed
+//! before this task. (2) [`validate_registry`] gains two checks: AC6.3
+//! (amendment 2026-07-18) — a weight-class `blocks` entry that has a
+//! `[blocks.<id>]` table but is absent from `blocks.order` is still
+//! unreachable and now `config_invalid`, closing the gap
+//! [`resolve_blocks_for_weight`]'s own doc comment already described as
+//! `validate_registry`'s job; and a duplicate id in `blocks.order`, which
+//! `resolve_blocks`/`resolve_blocks_for_weight` would otherwise silently
+//! double-resolve and double-emit. (3) [`substitute_placeholders`] is
+//! rewritten as a single left-to-right scan over the original content
+//! (was seven sequential `String::replace` calls, which let an earlier
+//! substitution's *output* be rescanned by a later placeholder's pass —
+//! see [`placeholder_substitutions`]). `cmd/dispcli`'s `try_assemble`
+//! (Task 10) now calls [`validate_request`]/[`validate_registry`] ahead
+//! of [`assemble`], so a malformed request/registry fails end-to-end
+//! through the CLI, not only at the unwired library-function level.
 
 use std::collections::BTreeMap;
 
@@ -959,6 +978,60 @@ fn normalize_scope_glob(pattern: &str) -> String {
     }
 }
 
+/// Metacharacters the R7 `branch` rule forbids anywhere in the value
+/// (spec line 331: "none of `~ ^ : ? * [`"). Deliberately narrower than
+/// full `git check-ref-format` — e.g. `{`/`}` are NOT in this set, and
+/// must stay accepted (the single-pass placeholder fixtures depend on a
+/// brace-bearing branch value being legal).
+const BRANCH_FORBIDDEN_METACHARACTERS: [char; 6] = ['~', '^', ':', '?', '*', '['];
+
+/// True when `branch` satisfies the R7 `branch` rule, transcribed
+/// verbatim from the ratified spec (line 331): "Required, non-empty, and
+/// a valid git ref name (`git check-ref-format` semantics): no control
+/// characters or spaces, no `..`, no leading `-`, no trailing `.lock`,
+/// and none of `~ ^ : ? * [`."
+///
+/// Implements **only** the clauses that sentence enumerates. Real
+/// `git check-ref-format` has further rules this spec row does not state
+/// (a single `@`, consecutive slashes, a trailing slash, empty path
+/// components) — deliberately not checked here; adding them would
+/// over-reject values the ratified text declares legal (e.g. a
+/// slash-namespaced branch, or `.lock` appearing mid-string rather than
+/// as the trailing element).
+///
+/// **"No control characters" reads as Rust's [`char::is_control`]**
+/// (Unicode `Cc`), not ASCII-only (Warden review dispatch-1719 N1). That
+/// is intentionally slightly wider than git's own rule (git rejects only
+/// `< 0x20` and DEL) — `is_control` additionally rejects the C1 range
+/// (U+0080–U+009F). Deliberate, not accidental drift: it is the natural
+/// reading of "no control characters," the extra-rejected values are
+/// pathological in a branch name regardless, and narrowing to ASCII would
+/// *weaken* the injection guard this rule exists to provide. Left as-is.
+fn is_valid_branch(branch: &str) -> bool {
+    if branch.is_empty() {
+        return false;
+    }
+    if branch.contains("..") {
+        return false;
+    }
+    if branch.starts_with('-') {
+        return false;
+    }
+    if branch.ends_with(".lock") {
+        return false;
+    }
+    if branch.chars().any(|c| c.is_control() || c == ' ') {
+        return false;
+    }
+    if branch
+        .chars()
+        .any(|c| BRANCH_FORBIDDEN_METACHARACTERS.contains(&c))
+    {
+        return false;
+    }
+    true
+}
+
 /// Shell metacharacters a `verify` entry may not contain (R7) — checked
 /// after `just `-prefix stripping, before the whitespace split.
 const VERIFY_SHELL_METACHARACTERS: [char; 11] =
@@ -1099,6 +1172,58 @@ fn absent_skills_remove_entries(
         .collect()
 }
 
+/// Looks `agent_id` up in `registry.agents`, returning the entry on a hit
+/// or the AC1.1 unknown-id `("agent", agent_id)` detail pair on a miss.
+/// The `"agent"` field label is produced **inside** this helper, not
+/// passed in by the caller — the same discipline
+/// [`absent_skills_remove_entries`] applies to its own
+/// `"skills_remove[i]"` field-path construction, so the label can't
+/// silently diverge between call sites the way a caller-supplied
+/// parameter could. Two call sites: [`validate_request`]'s combined
+/// pre-flight class and [`resolve_profile`]'s single-id assembly-time
+/// defense-in-depth copy (Task 10 fix round, Warden dispatch 1717 —
+/// previously hand-duplicated at both). Sibling helpers for the other two
+/// AC1.1 scalar-field checks: [`known_pattern`] (`task_pattern`),
+/// [`known_weight`] (`weight`) — three one-map functions rather than one
+/// map-plus-field-argument function, so each field label is written
+/// exactly once rather than threaded through every call site as a
+/// parameter.
+fn known_agent<'a>(
+    registry: &'a Registry,
+    agent_id: &str,
+) -> Result<&'a AgentEntry, (String, String)> {
+    registry
+        .agents
+        .get(agent_id)
+        .ok_or_else(|| ("agent".to_string(), agent_id.to_string()))
+}
+
+/// [`known_agent`]'s sibling for `registry.patterns` / `task_pattern`.
+/// Two call sites: [`validate_request`]'s combined pre-flight class and
+/// [`resolve_skills`]'s single-id assembly-time defense-in-depth copy.
+fn known_pattern<'a>(
+    registry: &'a Registry,
+    task_pattern: &str,
+) -> Result<&'a PatternEntry, (String, String)> {
+    registry
+        .patterns
+        .get(task_pattern)
+        .ok_or_else(|| ("task_pattern".to_string(), task_pattern.to_string()))
+}
+
+/// [`known_agent`]'s sibling for `registry.weights` / `weight`. Two call
+/// sites: [`validate_request`]'s combined pre-flight class and
+/// [`assemble`]'s single-id assembly-time defense-in-depth copy.
+fn known_weight<'a>(
+    registry: &'a Registry,
+    weight_id: &str,
+) -> Result<&'a WeightClass, (String, String)> {
+    registry
+        .weights
+        .get(weight_id)
+        .ok_or_else(|| ("weight".to_string(), weight_id.to_string()))
+}
+
 /// Validates `request` against `registry` (R1 AC1.1 unknown-id checks +
 /// every R7 request-side rule, plus R5/AC5.4's skills_remove-membership
 /// rule — Task 9). Runs each validation class in the order below,
@@ -1118,16 +1243,23 @@ fn absent_skills_remove_entries(
 /// one `"field"`/`"value"` detail pair per violating instance
 /// (recoverable via [`Error::all_details`]).
 pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Result<(), Error> {
-    // R1 AC1.1 — unknown agent / task_pattern / weight / skill id.
+    // R1 AC1.1 — unknown agent / task_pattern / weight / skill id. The
+    // agent/task_pattern/weight checks go through the shared
+    // known_agent/known_pattern/known_weight helpers (Task 10 fix round)
+    // so this combined class can't drift from each resolve function's own
+    // single-id defense-in-depth copy below (resolve_profile/
+    // resolve_skills/assemble); skills_add/skills_remove stay their own
+    // per-element loops — a different shape (list membership, not a
+    // single scalar field) the same helpers don't cover.
     let mut unknown_ids = Vec::new();
-    if !registry.agents.contains_key(&request.agent) {
-        unknown_ids.push(("agent".to_string(), request.agent.clone()));
+    if let Err(detail) = known_agent(registry, &request.agent) {
+        unknown_ids.push(detail);
     }
-    if !registry.patterns.contains_key(&request.task_pattern) {
-        unknown_ids.push(("task_pattern".to_string(), request.task_pattern.clone()));
+    if let Err(detail) = known_pattern(registry, &request.task_pattern) {
+        unknown_ids.push(detail);
     }
-    if !registry.weights.contains_key(&request.weight) {
-        unknown_ids.push(("weight".to_string(), request.weight.clone()));
+    if let Err(detail) = known_weight(registry, &request.weight) {
+        unknown_ids.push(detail);
     }
     for (i, skill_id) in request.skills_add.iter().enumerate() {
         if !registry.skills.contains_key(skill_id) {
@@ -1231,6 +1363,19 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
             ErrorKind::RequestInvalid,
             "repo/worktree/report_path must be absolute paths",
             bad_paths,
+        ));
+    }
+
+    // R7 — branch: required, non-empty, valid git ref name per the
+    // ratified clauses (see `is_valid_branch`'s doc comment for the
+    // verbatim spec quote). `branch` reaches skill/block content verbatim
+    // via `{branch}` substitution with no escaping layer, so it is
+    // constrained here at validation, not escaped at emission.
+    if !is_valid_branch(&env.branch) {
+        return Err(class_error(
+            ErrorKind::RequestInvalid,
+            "branch must be a non-empty, valid git ref name",
+            vec![("envelope.branch".to_string(), env.branch.clone())],
         ));
     }
 
@@ -1343,6 +1488,67 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
 /// is AC6.1's job, and needs the resolved profile content this IO-free
 /// function never has.
 ///
+/// Three more checks landed alongside the dangling-reference class (Task
+/// 10):
+/// - **AC6.3** (amendment 2026-07-18) — a weight-class `blocks` list
+///   entry that DOES have a `[blocks.<id>]` table (satisfying AC2.2's
+///   declaration requirement) but is absent from `blocks.order` is still
+///   unreachable, since `blocks.order` is the sole source of iteration
+///   order. Checked in the same weight-blocks loop as the AC2.2 dangling
+///   check, as an `else if` branch. **Distinguished from the AC2.2
+///   dangling case by a per-instance `"reason"` detail
+///   (`"undeclared"`/`"unreachable"`), not by a separate `Err` class**
+///   (Warden review dispatch-1719 M1, implemented via Warden's own
+///   stated alternative — not the finding's primary suggestion). The
+///   primary suggestion (a fully separate, independently-returned
+///   `config_invalid` class for AC6.3) was tried first and reverted: it
+///   broke `weight_class_block_declared_but_absent_from_order_is_rejected_as_config_invalid_per_ac6_3`
+///   (`cmd/dispcli/tests/integration.rs`, pinned, forbidden scope) —
+///   that test's fixture registry deliberately declares an AC2.2
+///   dangling weight (`ghost-block`) *and* an AC6.3 unreachable weight
+///   (`ghost-block-ordered`) side by side in one file (see the fixture's
+///   own doc comment), and this function validates the whole registry
+///   regardless of which weight the request names. With two
+///   mutually-exclusive, priority-ordered `Err` returns, the unrelated
+///   `ghost-block` AC2.2 instance always got returned first and silently
+///   masked the AC6.3 instance the test exists to exercise. Keeping one
+///   combined class — as before — means both instances stay visible in
+///   the same error's `details` regardless of which weight triggered
+///   which, which is what the shared fixture's design requires; the
+///   `"reason"` detail is what actually fixes M1's complaint (the
+///   message no longer asserts "undeclared" for an instance that is in
+///   fact declared-but-unreachable — a caller reads the per-instance
+///   `"reason"` instead of trusting the class-level `message` to
+///   distinguish the two).
+/// - A **duplicate id in `blocks.order`** is its own class, checked and
+///   returned ahead of the dangling/unreachable class: left unchecked, a
+///   duplicate silently double-resolves and double-emits the block's
+///   entire content (R8).
+/// - **AC6.4** (amendment 2026-07-18) — every declared `[blocks.<id>]`
+///   table must appear in `blocks.order`, independent of whether any
+///   weight class names it. **Generalizes AC6.3**: AC6.3 above only
+///   catches the sub-case where a weight class's explicit `blocks` list
+///   names the unreachable id; a block declared and ordered nowhere but
+///   named by NO weight at all (every weight using the `"all"` sentinel,
+///   which never inspects an explicit id list — see
+///   `validate_registry_accepts_weight_class_all_sentinel_without_treating_it_as_a_dangling_id`
+///   in `libs/dispcli-core/tests/integration.rs`) stayed silently dead
+///   config until this scan. Scanned registry-wide over
+///   `registry.blocks.blocks.keys()` against `blocks.order` — the
+///   mirror-image of the AC2.2 `blocks.order` loop above (that loop asks
+///   "does every `order` entry resolve to a declared table?"; this one
+///   asks "does every declared table appear in `order`?"). **Excludes
+///   ids already collected above as `"unreachable"`**: AC6.3's more
+///   specific reason (naming the weight class too) already reports
+///   those, and re-reporting the same id as `"orphan"` would duplicate
+///   one violation as two rather than report a second violation — this
+///   is also what keeps the pre-existing
+///   `validate_registry_reports_both_undeclared_and_unreachable_instances_together_when_both_present`
+///   regression lock's exact instance count unperturbed. Tagged
+///   `"reason": "orphan"`, folded into the same combined `config_invalid`
+///   class per the spec's no-masking rule (R6 AC6.4 reporting clause) —
+///   not a fourth `Err` class.
+///
 /// Two other R2 acceptance criteria are deliberately absent from this
 /// function's body:
 /// - **AC2.3** (closed `include` enum) needs no runtime check: `Include`
@@ -1358,11 +1564,56 @@ pub fn validate_request(request: &DispatchRequest, registry: &Registry) -> Resul
 ///   `FsContentResolver`, Task 3) at assembly time.
 ///
 /// # Errors
-/// A `config_invalid` [`Error`] carrying one `"field"`/`"value"` detail
-/// pair per dangling reference, collected in patterns → `blocks.order`
-/// → weights order (recoverable via [`Error::all_details`]).
+/// A `config_invalid` [`Error`] carrying, per violating instance, a
+/// `"field"`/`"value"` detail pair plus a `"reason"` detail
+/// (`"undeclared"` — no `[blocks.<id>]`/`[skills.<id>]` table exists at
+/// all; `"unreachable"` — AC6.3's shape, the table exists, the id is
+/// absent from `blocks.order`, and a weight class's `blocks` list names
+/// it; `"orphan"` — AC6.4's shape, the table exists, the id is absent
+/// from `blocks.order`, and no weight class names it) — the three keys
+/// are paired by position, one triple per instance, recoverable via
+/// [`Error::all_details`]. A duplicate `blocks.order` id returns
+/// immediately as its own class (checked first, no `"reason"` — the
+/// defect shape there needs no disambiguation). Otherwise every dangling
+/// (AC2.2), unreachable (AC6.3), and orphan (AC6.4) instance across
+/// patterns → `blocks.order` → weights → every declared block is
+/// collected and, when any is non-empty, returned together in one
+/// combined error — not as separate classes (see the `"reason"` note
+/// above the weight-blocks loop for why a fully separate AC6.3 class was
+/// tried and reverted, and the AC6.4 bullet above for why an orphan
+/// instance is suppressed when the same id already appears as
+/// `"unreachable"`).
 pub fn validate_registry(registry: &Registry) -> Result<(), Error> {
+    // R8 (Task 10) — a duplicate id in `blocks.order` is its own class,
+    // checked and returned ahead of the dangling/unreachable class below:
+    // "the same id appears twice" is a different defect shape than "this
+    // id doesn't exist," and collapsing the two into one message would
+    // blur which defect a caller is looking at. Left unchecked, a
+    // duplicate silently double-resolves and double-emits the block's
+    // entire content (`resolve_blocks`/`resolve_blocks_for_weight`
+    // iterate `blocks.order` with no dedup).
+    let mut duplicate_order = Vec::new();
+    let mut seen_order_ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (i, block_id) in registry.blocks.order.iter().enumerate() {
+        if !seen_order_ids.insert(block_id.as_str()) {
+            duplicate_order.push((format!("blocks.order[{i}]"), block_id.clone()));
+        }
+    }
+    if !duplicate_order.is_empty() {
+        return Err(class_error(
+            ErrorKind::ConfigInvalid,
+            "blocks.order contains one or more duplicate ids",
+            duplicate_order,
+        ));
+    }
+
+    // `dangling` (AC2.2) and `unreachable` (AC6.3) stay one combined
+    // `config_invalid` class, distinguished per-instance by a `"reason"`
+    // detail rather than by two separate `Err` returns — see the
+    // function doc comment's AC6.3 bullet for why (Warden review
+    // dispatch-1719 M1).
     let mut dangling = Vec::new();
+    let mut unreachable = Vec::new();
 
     for (pattern_id, pattern) in &registry.patterns {
         for (i, skill_id) in pattern.skills.iter().enumerate() {
@@ -1392,18 +1643,76 @@ pub fn validate_registry(registry: &Registry) -> Result<(), Error> {
         if let AllOrList::List(block_ids) = &weight.blocks {
             for (i, block_id) in block_ids.iter().enumerate() {
                 if !registry.blocks.blocks.contains_key(block_id) {
+                    // AC2.2 — no `[blocks.<id>]` table anywhere.
                     dangling.push((format!("weights.{weight_id}.blocks[{i}]"), block_id.clone()));
+                } else if !registry.blocks.order.contains(block_id) {
+                    // AC6.3 — declared but unreachable. Same field-path
+                    // format as the AC2.2 branch above — it already
+                    // embeds both the weight class id and the
+                    // unreachable id, so no new detail-key convention is
+                    // needed to satisfy AC6.3's "names the weight class
+                    // and the unreachable id" requirement. Pushed to the
+                    // separate `unreachable` vec, tagged `"reason":
+                    // "unreachable"` below.
+                    unreachable
+                        .push((format!("weights.{weight_id}.blocks[{i}]"), block_id.clone()));
                 }
             }
         }
     }
 
-    if !dangling.is_empty() {
-        return Err(class_error(
+    // AC6.4 (amendment 2026-07-18) — every declared `[blocks.<id>]` table
+    // must appear in `blocks.order`, independent of whether any weight
+    // class names it. Mirrors the AC2.2 `blocks.order` loop above in
+    // reverse: that loop asks "does every `order` entry resolve to a
+    // declared table?"; this scan asks "does every declared table appear
+    // in `order`?" — registry-wide, not per-weight, since a weight using
+    // the `"all"` sentinel never inspects an explicit block id list and
+    // so never reaches the AC6.3 branch above. Ids already collected as
+    // `"unreachable"` are excluded: AC6.3's reason is more specific
+    // (it also names the weight class), and re-reporting the same id here
+    // would duplicate one violation as two rather than surface a second
+    // one — see the function doc comment's AC6.4 bullet.
+    let unreachable_ids: std::collections::BTreeSet<&str> =
+        unreachable.iter().map(|(_, id)| id.as_str()).collect();
+    let mut orphan = Vec::new();
+    for block_id in registry.blocks.blocks.keys() {
+        if !registry.blocks.order.contains(block_id) && !unreachable_ids.contains(block_id.as_str())
+        {
+            orphan.push((format!("blocks.{block_id}"), block_id.clone()));
+        }
+    }
+
+    if !dangling.is_empty() || !unreachable.is_empty() || !orphan.is_empty() {
+        let mut err = Error::new(
             ErrorKind::ConfigInvalid,
-            "registry references one or more undeclared ids",
-            dangling,
-        ));
+            "registry references one or more ids that are undeclared, \
+             unreachable, or orphaned — see each instance's \"reason\" \
+             detail: \"undeclared\" (no matching declaration exists at \
+             all), \"unreachable\" (declared, absent from blocks.order, \
+             and named by a weight class's blocks list), or \"orphan\" \
+             (declared, absent from blocks.order, and named by no weight \
+             class)",
+        );
+        for (field, value) in dangling {
+            err = err
+                .with_detail("field", field)
+                .with_detail("value", value)
+                .with_detail("reason", "undeclared");
+        }
+        for (field, value) in unreachable {
+            err = err
+                .with_detail("field", field)
+                .with_detail("value", value)
+                .with_detail("reason", "unreachable");
+        }
+        for (field, value) in orphan {
+            err = err
+                .with_detail("field", field)
+                .with_detail("value", value)
+                .with_detail("reason", "orphan");
+        }
+        return Err(err);
     }
 
     Ok(())
@@ -1565,22 +1874,23 @@ fn join_sections(sections: Vec<Section>, warnings: Vec<String>) -> AssembledDocu
 /// Resolves the agent's profile content (R5 step 1). Returns
 /// `request_invalid` when `agent_id` has no registry entry — the same
 /// AC1.1 "unknown agent" rejection [`validate_request`] (Task 6) reports
-/// earlier in the pipeline, with the same `field`/`value` detail shape.
-/// This defense-in-depth copy guarantees assembly still fails loudly
-/// (rather than panicking) when `assemble_standard` is called directly,
-/// without `validate_request` having run first.
+/// earlier in the pipeline, with the same `field`/`value` detail shape,
+/// via the shared [`known_agent`] helper so that detail construction
+/// can't drift between the two call sites (Task 10 fix round). This
+/// defense-in-depth copy guarantees assembly still fails loudly (rather
+/// than panicking) when `assemble_standard` is called directly, without
+/// `validate_request` having run first.
 fn resolve_profile(
     agent_id: &str,
     registry: &Registry,
     resolver: &dyn ContentResolver,
 ) -> Result<String, Error> {
-    let agent = registry.agents.get(agent_id).ok_or_else(|| {
-        Error::new(
+    let agent = known_agent(registry, agent_id).map_err(|(field, value)| {
+        class_error(
             ErrorKind::RequestInvalid,
             format!("unknown agent '{agent_id}'"),
+            vec![(field, value)],
         )
-        .with_detail("field", "agent")
-        .with_detail("value", agent_id)
     })?;
     resolver.resolve(agent_id, &agent.profile)
 }
@@ -1603,7 +1913,8 @@ fn resolve_profile(
 ///
 /// # Errors
 /// `request_invalid` for an unknown `task_pattern` (previews AC1.1, see
-/// [`resolve_profile`]); `request_invalid` for a `skills_add` entry with
+/// [`resolve_profile`] — same shared-helper treatment via [`known_pattern`],
+/// Task 10 fix round); `request_invalid` for a `skills_add` entry with
 /// no registry entry (AC1.1 — a request-side problem: the caller named a
 /// skill that doesn't exist, distinct from the pattern-sourced case
 /// below) or a `skills_remove` entry absent from the effective set
@@ -1622,13 +1933,12 @@ fn resolve_skills(
     resolver: &dyn ContentResolver,
 ) -> Result<Vec<(String, String)>, Error> {
     let task_pattern = request.task_pattern.as_str();
-    let pattern = registry.patterns.get(task_pattern).ok_or_else(|| {
-        Error::new(
+    let pattern = known_pattern(registry, task_pattern).map_err(|(field, value)| {
+        class_error(
             ErrorKind::RequestInvalid,
             format!("unknown task_pattern '{task_pattern}'"),
+            vec![(field, value)],
         )
-        .with_detail("field", "task_pattern")
-        .with_detail("value", task_pattern)
     })?;
 
     // AC1.1 defense-in-depth: skills_add referencing an undeclared skill
@@ -1760,9 +2070,54 @@ fn resolve_blocks_for_weight(
     Ok(resolved)
 }
 
+/// The `(name, value)` pairs [`substitute_placeholders`] resolves for one
+/// call, in no particular order — a single-pass scan matches by name, not
+/// by call sequence, so ordering here has no behavioral effect (contrast
+/// with the old sequential-`.replace()` implementation, where call order
+/// was exactly the single-pass defect: an earlier substitution's *output*
+/// could be rescanned by a later call). `{task_id}`/`{worktree_path}` are
+/// conditionally omitted when the envelope's corresponding field is null
+/// — R5's table substitutes them "only when non-null" — so those two
+/// tokens are left as literal text in `content` for
+/// [`check_no_unresolved_placeholders`] (AC5.2) to catch, exactly
+/// matching the old implementation's conditional-skip semantics.
+fn placeholder_substitutions(
+    request: &DispatchRequest,
+    envelope: &Envelope,
+) -> Vec<(&'static str, String)> {
+    let mut subs = vec![
+        ("dispatch_id", envelope.dispatch_id.to_string()),
+        ("agent_name", request.agent.clone()),
+        ("project_path", envelope.repo.clone()),
+        ("branch", envelope.branch.clone()),
+        ("report_path", envelope.report_path.clone()),
+    ];
+    if let Some(task_id) = envelope.task_id {
+        subs.push(("task_id", task_id.to_string()));
+    }
+    if let Some(worktree) = envelope.worktree.as_deref() {
+        subs.push(("worktree_path", worktree.to_string()));
+    }
+    subs
+}
+
 /// Applies best-effort supported-placeholder substitution (R5 placeholder
-/// table) to skill/template-block content. Substitution is unconditional
-/// text replacement — a placeholder not present in `content` is a no-op.
+/// table) to skill/template-block content in a **single left-to-right
+/// pass over the original `content`** — a value substituted for one
+/// placeholder is never rescanned for a later placeholder's token (Task
+/// 10, R8; the pre-existing defect this replaces was seven sequential
+/// `String::replace` calls, so a `branch` value containing the literal
+/// text `{report_path}` got second-order-substituted by the later
+/// `report_path` pass). The scan walks `content` once: on every `{`, it
+/// looks for the next `}`, and if the text between them exactly matches a
+/// resolvable placeholder name (see [`placeholder_substitutions`]),
+/// emits the substitution value; otherwise the whole `{...}` span —
+/// including an unsupported token or a supported-but-null conditional
+/// placeholder — is copied through unchanged, so it survives into the
+/// output for [`check_no_unresolved_placeholders`] (AC5.2) or
+/// [`unsupported_brace_tokens`] (AC5.3) to find. A `{` with no matching
+/// `}` before the end of `content` is copied through as literal text.
+///
 /// This function only performs the substitution itself and never fails:
 /// a placeholder left unsubstituted afterward is AC5.2's job to catch
 /// ([`check_no_unresolved_placeholders`], run by [`assemble_standard`] on
@@ -1775,17 +2130,49 @@ fn substitute_placeholders(
     request: &DispatchRequest,
     envelope: &Envelope,
 ) -> String {
-    let mut out = content.replace("{dispatch_id}", &envelope.dispatch_id.to_string());
-    if let Some(task_id) = envelope.task_id {
-        out = out.replace("{task_id}", &task_id.to_string());
+    let subs = placeholder_substitutions(request, envelope);
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(open) = rest.find('{') {
+        let Some(before_open) = rest.get(..open) else {
+            break;
+        };
+        out.push_str(before_open);
+        let Some(after_open) = rest.get(open + 1..) else {
+            // `{` was the last byte — nothing left to scan; treat it as
+            // literal (no closing brace can follow).
+            out.push('{');
+            rest = "";
+            break;
+        };
+        let Some(close) = after_open.find('}') else {
+            // No closing brace anywhere in the remainder — the rest of
+            // `content`, including this `{`, is literal text.
+            out.push('{');
+            out.push_str(after_open);
+            rest = "";
+            break;
+        };
+        let Some(inner) = after_open.get(..close) else {
+            // Not a char boundary (should not happen — `find` returns
+            // boundaries in practice) — treat `{` as literal and keep
+            // scanning from just past it, matching the "no closing brace"
+            // fallback's fail-safe posture.
+            out.push('{');
+            rest = after_open;
+            continue;
+        };
+        match subs.iter().find(|(name, _)| *name == inner) {
+            Some((_, value)) => out.push_str(value),
+            None => {
+                out.push('{');
+                out.push_str(inner);
+                out.push('}');
+            }
+        }
+        rest = after_open.get(close + 1..).unwrap_or_default();
     }
-    out = out.replace("{agent_name}", &request.agent);
-    out = out.replace("{project_path}", &envelope.repo);
-    if let Some(worktree) = envelope.worktree.as_deref() {
-        out = out.replace("{worktree_path}", worktree);
-    }
-    out = out.replace("{branch}", &envelope.branch);
-    out = out.replace("{report_path}", &envelope.report_path);
+    out.push_str(rest);
     out
 }
 
@@ -1823,6 +2210,46 @@ const SUPPORTED_PLACEHOLDERS: [&str; 7] = [
 /// a no-task dispatch) — not a gap to work around; see the Task 9
 /// dispatch's intentional-gap note.
 ///
+/// **Matching-rule asymmetry with [`substitute_placeholders`] is
+/// deliberate and security-load-bearing — do not harmonize the two
+/// matchers.** (Warden review dispatch-1722, security disposition: NO
+/// ACTION — the asymmetry is safe, fails closed, and is load-bearing;
+/// supersedes dispatch-1719 finding L1, which had mis-framed this as an
+/// open spec question rather than a security question with a provable
+/// answer.) `substitute_placeholders` is single-pass and token-exact
+/// (`inner == name` on the text strictly between one `{`/`}` pair); this
+/// function matches by substring (`content.contains(placeholder)`)
+/// against [`SUPPORTED_PLACEHOLDERS`]'s literal `{name}` forms. This
+/// substring rule matches a strict **superset** of what
+/// `substitute_placeholders` matches: every span substitution can
+/// possibly leave un-substituted is, by construction, still a literal
+/// `{name}` substring, and `.contains()` finds every literal substring —
+/// there is no input where substitution declines to act and this scan
+/// also misses it. The two rules diverge exactly where the superset is
+/// strictly wider, e.g. nested braces: content containing `{{branch}}`
+/// is not touched by substitution (`inner` there is `"{branch"`, which
+/// matches no placeholder name — the identity-copy `None` arm leaves it
+/// byte-identical), yet this function's substring scan still finds
+/// `"{branch}"` inside it and correctly trips AC5.2 rather than letting
+/// the token reach an emitted section. **Making the two matchers agree
+/// (e.g. switching this function to token-exact matching too) would
+/// narrow this check and reopen exactly that hole** — the asymmetry
+/// *is* the guard, not an inconsistency to clean up. The only failure
+/// direction the asymmetry can produce is over-erroring (rejecting
+/// content whose embedded token was in fact resolvable, or that carries
+/// no live placeholder at all — see the ruling's traces 1-4), never
+/// under-erroring.
+///
+/// **Invariant this establishes:** no emitted skill or block section can
+/// contain any [`SUPPORTED_PLACEHOLDERS`] token as a substring — this
+/// function sits on the sole funnel (`push_processed_section`) with `?`
+/// evaluated before the section is pushed, and no other code path pushes
+/// skill or block content. **Scoped to skill/block sections, not the
+/// document as a whole:** the profile and `task_body` sections bypass
+/// both [`substitute_placeholders`] and this check entirely (R5 scopes
+/// substitution to skill/block content only), so either may carry
+/// literal brace text the invariant says nothing about.
+///
 /// # Errors
 /// An [`AssemblyFailed`](ErrorKind::AssemblyFailed) [`Error`] naming the
 /// offending `section` (the `size.components[].section` name — e.g.
@@ -1832,17 +2259,38 @@ const SUPPORTED_PLACEHOLDERS: [&str; 7] = [
 /// fails fast on resolution/content problems generally (see
 /// [`resolve_profile`]/[`resolve_skills`]/[`resolve_blocks`]), unlike
 /// `validate_request`'s request-side collect-all-in-class rule (R7).
-fn check_no_unresolved_placeholders(section_name: &str, content: &str) -> Result<(), Error> {
+///
+/// `raw_content` is the section's content *before*
+/// [`substitute_placeholders`] ran — used only to word the human-facing
+/// `message` correctly (Warden review dispatch-1719 L2): when the
+/// offending placeholder is absent from `raw_content`, it was not
+/// authored in the skill/block's own source but introduced by another
+/// field's substitution (e.g. a `branch` value containing the literal
+/// text `{task_id}`), and the message says so rather than pointing an
+/// operator at a skill file that has nothing wrong with it. The `kind`
+/// and `"section"`/`"placeholder"` details are unaffected either way —
+/// only `message` moves.
+fn check_no_unresolved_placeholders(
+    section_name: &str,
+    content: &str,
+    raw_content: &str,
+) -> Result<(), Error> {
     for placeholder in SUPPORTED_PLACEHOLDERS {
         if content.contains(placeholder) {
-            return Err(Error::new(
-                ErrorKind::AssemblyFailed,
+            let message = if raw_content.contains(placeholder) {
                 format!(
                     "supported placeholder '{placeholder}' remains unsubstituted in '{section_name}'"
-                ),
-            )
-            .with_detail("section", section_name)
-            .with_detail("placeholder", placeholder));
+                )
+            } else {
+                format!(
+                    "supported placeholder '{placeholder}' remains unsubstituted in \
+                     '{section_name}' (introduced by placeholder substitution, not \
+                     present in the source section)"
+                )
+            };
+            return Err(Error::new(ErrorKind::AssemblyFailed, message)
+                .with_detail("section", section_name)
+                .with_detail("placeholder", placeholder));
         }
     }
     Ok(())
@@ -1964,7 +2412,7 @@ fn push_processed_section(
     envelope: &Envelope,
 ) -> Result<(), Error> {
     let content = substitute_placeholders(raw_content, request, envelope);
-    check_no_unresolved_placeholders(&section_name, &content)?;
+    check_no_unresolved_placeholders(&section_name, &content, raw_content)?;
     record_brace_warnings(&section_name, &content, warnings);
     sections.push(Section {
         name: section_name,
@@ -2406,9 +2854,10 @@ fn resolve_fixed_skills(
 ///
 /// # Errors
 /// A [`RequestInvalid`](ErrorKind::RequestInvalid) [`Error`] for an
-/// unknown `weight` id (AC1.1 defense-in-depth, same precedent as
-/// [`resolve_profile`]/[`resolve_skills`]'s unknown-agent/task_pattern
-/// checks), a `skills_add`/`skills_remove` problem under either the
+/// unknown `weight` id (AC1.1 defense-in-depth via the shared
+/// [`known_weight`] helper, same precedent as [`resolve_profile`]/
+/// [`resolve_skills`]'s unknown-agent/task_pattern checks — Task 10 fix
+/// round), a `skills_add`/`skills_remove` problem under either the
 /// pattern-based or fixed-list merge (same AC1.1/AC5.4 rules — see
 /// [`resolve_skills`]/[`resolve_fixed_skills`]), or anything
 /// [`resolve_profile`] itself returns; a
@@ -2427,13 +2876,12 @@ pub fn assemble(
     resolver: &dyn ContentResolver,
 ) -> Result<AssembledDocument, Error> {
     let weight_id = request.weight.as_str();
-    let weight = registry.weights.get(weight_id).ok_or_else(|| {
-        Error::new(
+    let weight = known_weight(registry, weight_id).map_err(|(field, value)| {
+        class_error(
             ErrorKind::RequestInvalid,
             format!("unknown weight '{weight_id}'"),
+            vec![(field, value)],
         )
-        .with_detail("field", "weight")
-        .with_detail("value", weight_id)
     })?;
 
     let envelope = Envelope::from_request(request);

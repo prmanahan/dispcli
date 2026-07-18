@@ -1,0 +1,34 @@
+# assembly_failed (exit 6) CLI-level fixture (Task 10 red phase, AC5.2,
+# AC8.2). `skills/needs-task.md` *authors* the literal `{task_id}` token
+# itself (not introduced via another placeholder's substitution — contrast
+# with `single-pass/`); paired with a null `envelope.task_id` in the
+# request, this is AC5.2's documented intentional failure mode. Already
+# covered at the `dispcli-core` unit level
+# (`unresolved_task_id_placeholder_in_always_included_skill_is_intentional_assembly_failure`);
+# not yet exercised through the CLI binary end-to-end (R8's error-kind
+# exit-code matrix, item 2 of the Task 10 dispatch).
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.needs-task]
+path = "skills/needs-task.md"
+
+[patterns.implementation]
+skills = ["needs-task"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"

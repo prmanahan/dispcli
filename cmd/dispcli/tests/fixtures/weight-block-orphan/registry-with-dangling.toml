@@ -1,0 +1,51 @@
+# AC6.4 no-masking fixture (Task 10 red phase, spec 0001 R6 AC6.4 —
+# amendment 2026-07-18): the same orphan block as `registry.toml`
+# (`orphan-block` — declared, absent from `blocks.order`, named by no
+# weight class), PLUS an unrelated AC2.2 dangling reference
+# (`weights.dangling.blocks = ["nonexistent-block"]`, which has no
+# `[blocks.nonexistent-block]` table anywhere) in the same file.
+#
+# This is the black-box counterpart to the core-level regression lock
+# `validate_registry_reports_both_undeclared_and_unreachable_instances_together_when_both_present`
+# (`libs/dispcli-core/tests/integration.rs`) — except the two co-present
+# shapes here are AC6.4 (orphan) + AC2.2 (undeclared), not AC2.2 +
+# AC6.3. `validate_registry` scans the whole registry regardless of which
+# weight the request names (see that function's doc comment), so both
+# instances MUST land in the same combined `config_invalid` error's
+# `details`, each tagged with its own `"reason"` — neither may mask the
+# other. This is exactly the priority-ordered-split failure mode the
+# ratified AC6.4 text calls out by name ("any priority-ordered split lets
+# one class mask another").
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[blocks.orphan-block]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"
+
+[weights.dangling]
+profile_sections = "all"
+blocks = ["nonexistent-block"]

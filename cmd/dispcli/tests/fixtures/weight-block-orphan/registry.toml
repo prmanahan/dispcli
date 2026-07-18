@@ -1,0 +1,45 @@
+# AC6.4 orphan-block fixture (Task 10 red phase, spec 0001 R6 AC6.4 —
+# amendment 2026-07-18): a `[blocks.<id>]` table that is declared, absent
+# from `blocks.order`, and named by NO weight class.
+#
+# This is deliberately the clean, single-defect-shape case — `orphan-block`
+# is the only self-consistency violation in this registry. Distinguishes
+# from the sibling `weight-block-dangling/` fixture's AC6.3 shape
+# (`declared-not-ordered`), which IS named by a weight class
+# (`weights.ghost-block-ordered.blocks = ["declared-not-ordered"]`) and so
+# is caught by the weight-scoped unreachable check, not this one.
+# AC6.4 generalizes AC6.3 precisely because `orphan-block` here is named by
+# nothing at all: `weights.standard` uses the `"all"` sentinel (not an
+# explicit list), so no weight-scoped check ever inspects `orphan-block` —
+# only a registry-wide scan of every declared `[blocks.<id>]` table against
+# `blocks.order` can catch it. Before AC6.4, this exact registry validated
+# cleanly and `orphan-block` sat as silently dead config forever.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[blocks.orphan-block]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"

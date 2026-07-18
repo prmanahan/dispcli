@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 · Amended (AC6.3 weight-class block reachability) — 2026-07-18 · Amended (R7 `branch` scope — enumerated subset, not ref-format parity) — 2026-07-18 · Amended (AC6.4 — every declared block must be ordered) — 2026-07-18 · Annotated (R7 alternatives-considered + security basis; no normative change) — 2026-07-18 |
+| **Status** | Accepted — 2026-07-12 · Amended (gap resolutions, R2/R5/R6/R7/R8) — 2026-07-15 · Amended (AC5.2 scope, R7 `branch` rule, R5 fixed-skills clarity pin) — 2026-07-17 · Amended (AC6.3 weight-class block reachability) — 2026-07-18 · Amended (R7 `branch` scope — enumerated subset, not ref-format parity) — 2026-07-18 · Amended (AC6.4 — every declared block must be ordered) — 2026-07-18 |
 | **Scope** | v0: dispatch-request input schema, registry config, resolver traits, envelope + prompt construction, CLI output contract |
 | **Out of scope** | Worktree execution, cost-metric emission, post-dispatch verification, WASM/plugin frontend (all v1+) |
 
@@ -364,25 +364,6 @@ within a class).
   (`envelope.verify[1]`) and the offending value.
 - AC7.3 — Trailing-slash normalization is observable in the emitted
   envelope (the document contains `path/**`, not `path/`).
-
-**Alternatives considered — `branch` rule scope** (recorded 2026-07-18 with
-the enumerated-subset amendment). Tightening `branch` to full
-`git check-ref-format` parity was the other candidate, and was rejected for
-v0: the enumerated list already covers the injection-shaped risks R7 exists
-to defend, and parity is scope this spec never wanted. The deferral is
-recorded in the `branch` row itself rather than dropped, so a later reader
-sees a decision rather than an oversight.
-
-A security review of the enumerated set (2026-07-18) found no value that
-clears the list and still injects meaningfully through `{branch}`
-substitution: two clauses carry it — **no control characters** means no
-newline, so a payload cannot open a YAML key, a markdown block, or an
-instruction paragraph; **no spaces** means any payload is a contiguous
-single-line token that cannot form prose. That is the basis for treating
-the enumerated set as sufficient rather than provisional. Note the
-consequence for future work: the residual exposure in this area is
-`task_body` — free text, no validation, reaching the prompt verbatim — not
-`branch`, which is among the most constrained fields in the request.
 
 ## R8 — Output contract and error taxonomy
 

@@ -1,0 +1,4 @@
+# Deliberately truncated/invalid TOML (unterminated table header) for the
+# config_invalid parse-failure CLI scenario (AC8.2, no panic).
+[registry
+skills_root = "skills"

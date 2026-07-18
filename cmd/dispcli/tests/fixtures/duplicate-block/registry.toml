@@ -1,0 +1,36 @@
+# Duplicate `blocks.order` id fixture (Task 10 red phase).
+#
+# `order = ["metrics", "metrics"]` — the same block id listed twice.
+# Today this is NOT rejected by `validate_registry` (which only checks
+# each `order` entry resolves to a declared `[blocks.<id>]` table, never
+# checks for duplicates) and `resolve_blocks`/`resolve_blocks_for_weight`
+# happily resolve + include the block twice, so its content is emitted
+# twice in the assembled document (confirmed by manual probe: two
+# identical "block:metrics" components, two copies of the block's prose).
+# The spec-correct behavior is a `config_invalid` rejection, not silent
+# double emission.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics", "metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"
