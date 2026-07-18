@@ -1817,6 +1817,122 @@ fn validate_registry_rejects_dangling_weight_block_list_entry_with_field_and_val
     assert_eq!(err.kind, ErrorKind::ConfigInvalid);
     assert_eq!(err.detail("field"), Some("weights.light.blocks[1]"));
     assert_eq!(err.detail("value"), Some("ghost-block"));
+    assert_eq!(
+        err.detail("reason"),
+        Some("undeclared"),
+        "AC2.2's shape (no [blocks.<id>] table anywhere) must carry \
+         reason=\"undeclared\", distinct from AC6.3's \"unreachable\" \
+         (Warden review dispatch-1719 M1)"
+    );
+}
+
+#[test]
+fn validate_registry_rejects_unreachable_weight_block_absent_from_blocks_order_per_ac6_3() {
+    // AC6.3 (amendment 2026-07-18): a weight-class `blocks` entry that
+    // DOES have a `[blocks.<id>]` table (satisfying AC2.2's declaration
+    // requirement) but is absent from `blocks.order` is still
+    // unreachable -- `resolve_blocks_for_weight` only ever walks
+    // `blocks.order`. Distinct from the AC2.2 dangling case above (no
+    // `[blocks.<id>]` table at all); both branches share one combined
+    // `config_invalid` class (Warden review dispatch-1719 M1 rework: a
+    // fully separate `Err` class per branch was tried first and reverted
+    // -- see the `validate_registry` doc comment), disambiguated by the
+    // `"reason"` detail. This test pins that `"reason"` is exactly
+    // `"unreachable"` here, not `"undeclared"` -- the machine-readable
+    // half of the M1 fix that the black-box `cmd/dispcli` tests, which
+    // only ever assert on `"field"`/`"value"`, cannot exercise.
+    let mut registry = sample_registry();
+    registry.blocks.blocks.insert(
+        "declared-not-ordered".to_string(),
+        BlockEntry {
+            path: "skills/dispatch-metrics.md".to_string(),
+            include: Include::Always,
+        },
+    );
+    registry.weights.insert(
+        "light".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: None,
+            blocks: AllOrList::List(vec!["declared-not-ordered".to_string()]),
+        },
+    );
+
+    let err = validate_registry(&registry).expect_err(
+        "a weight-class block id declared but absent from blocks.order must be rejected (AC6.3)",
+    );
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(err.detail("field"), Some("weights.light.blocks[0]"));
+    assert_eq!(err.detail("value"), Some("declared-not-ordered"));
+    assert_eq!(
+        err.detail("reason"),
+        Some("unreachable"),
+        "AC6.3's shape must carry reason=\"unreachable\" -- this is the \
+         machine-readable fix for M1 (the class-level message alone no \
+         longer has to, and does not, disambiguate the two defect shapes)"
+    );
+}
+
+#[test]
+fn validate_registry_reports_both_undeclared_and_unreachable_instances_together_when_both_present()
+{
+    // Regression lock for the masking bug M1's first (reverted)
+    // implementation attempt introduced: a registry that simultaneously
+    // has an AC2.2 dangling weight-block reference AND an AC6.3
+    // unreachable one (this is exactly what
+    // `cmd/dispcli/tests/fixtures/weight-block-dangling/registry.toml`
+    // does, deliberately, per its own doc comment) must report BOTH
+    // instances in one combined error, each tagged with its own
+    // `"reason"` -- not have one silently mask the other via a
+    // priority-ordered separate-class return.
+    let mut registry = sample_registry();
+    registry.blocks.blocks.insert(
+        "declared-not-ordered".to_string(),
+        BlockEntry {
+            path: "skills/dispatch-metrics.md".to_string(),
+            include: Include::Always,
+        },
+    );
+    registry.weights.insert(
+        "heavy-dangling".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: None,
+            blocks: AllOrList::List(vec!["ghost-block".to_string()]),
+        },
+    );
+    registry.weights.insert(
+        "light-unreachable".to_string(),
+        WeightClass {
+            profile_sections: AllOrList::All("all".to_string()),
+            skills: None,
+            blocks: AllOrList::List(vec!["declared-not-ordered".to_string()]),
+        },
+    );
+
+    let err = validate_registry(&registry)
+        .expect_err("a registry with both defect shapes present must be rejected");
+    assert_eq!(err.kind, ErrorKind::ConfigInvalid);
+    assert_eq!(
+        err.all_details("field"),
+        vec![
+            "weights.heavy-dangling.blocks[0]",
+            "weights.light-unreachable.blocks[0]",
+        ],
+        "both instances must survive into the same error -- neither may \
+         mask the other"
+    );
+    assert_eq!(
+        err.all_details("value"),
+        vec!["ghost-block", "declared-not-ordered"]
+    );
+    assert_eq!(
+        err.all_details("reason"),
+        vec!["undeclared", "unreachable"],
+        "reason must be paired by position with field/value, one per \
+         instance, distinguishing the two defect shapes even though both \
+         landed in the same config_invalid class"
+    );
 }
 
 #[test]
@@ -1871,6 +1987,15 @@ fn validate_registry_collects_dangling_references_across_patterns_blocks_and_wei
         .expect("pattern present in fixture")
         .skills = vec!["ghost-pattern-skill".to_string()];
     registry.blocks.order = vec!["ghost-block".to_string()];
+    // AC6.4 (Task 10) — `sample_registry()`'s three default `[blocks.<id>]`
+    // tables (metrics/merge-msg/task-tracking) are stale once `order` above
+    // is replaced wholesale: none of them survive into the new `order`, and
+    // none is named by a weight class here, so the AC6.4 orphan scan would
+    // otherwise report all three as extra, unintended `"orphan"` instances
+    // this test isn't about. Clearing them keeps this test scoped to what
+    // it actually exercises — one dangling reference per source (pattern,
+    // `blocks.order`, weight skills, weight blocks), collected together.
+    registry.blocks.blocks.clear();
     registry.weights.insert(
         "light".to_string(),
         WeightClass {

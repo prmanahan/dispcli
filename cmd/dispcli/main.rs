@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use dispcli_core::{
     DocumentSink, Error, ErrorKind, SizeSummary, Summary, WorktreeSummary, assemble,
-    parse_registry, parse_request,
+    parse_registry, parse_request, validate_registry, validate_request,
 };
 use dispcli_io::{FsContentResolver, FsDocumentSink};
 
@@ -144,6 +144,33 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
     })?;
     let registry = parse_registry(&registry_str)?;
 
+    // R2 registry-side and R1/R7 request-side pre-flight validation (Task
+    // 10 wiring) — both run before any resolution or output, so a
+    // malformed request/registry yields its config_invalid (4) /
+    // request_invalid (3) error end-to-end through the CLI, not only as an
+    // unwired dispcli-core function. `assemble`'s own inline unknown-
+    // agent/task_pattern/weight checks (`resolve_profile`/`resolve_skills`/
+    // `resolve_fixed_skills`) stay in place as documented assembly-time
+    // defense-in-depth for callers that invoke `assemble`/`assemble_standard`
+    // directly without this pipeline (the dispcli-core unit tests) — with
+    // validation running first here, they simply never fire via the CLI.
+    //
+    // Registry validated first, request second (Warden review dispatch-1719
+    // L3): the registry is a static operator artifact and the request is
+    // per-dispatch — a request cannot be meaningfully validated against a
+    // config that is itself invalid, so a broken registry should surface as
+    // the operator's config defect (config_invalid) rather than get
+    // misattributed to the caller's request (request_invalid) merely
+    // because the request happens to name an id the broken registry lacks.
+    // The spec does not pin an ordering between the two; this is a judgment
+    // call, not a spec requirement. Confirmed against every cmd/dispcli
+    // black-box fixture pairing an invalid registry with a request: none
+    // pairs a config_invalid registry with a request that would
+    // independently fail validate_request, so this reordering does not
+    // flip any pinned exit code.
+    validate_registry(&registry)?;
+    validate_request(&request, &registry)?;
+
     // Content resolution is rooted at the registry file's directory (R3),
     // never the process cwd.
     let registry_dir = config_path
@@ -184,12 +211,51 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
     let sink = FsDocumentSink::new();
     sink.write(&out_path, &assembled.document)?;
 
+    // R8's `document_path` contract is an absolute path
+    // (`"/abs/path/to/output.md"`) — canonicalize failing after a
+    // successful write is not swallowed into a silent relative-path
+    // fallback (Warden review dispatch-1719, item 6). Surfacing it as
+    // `io_failed` (exit 7) is consistent with `FsDocumentSink`'s own
+    // convention (`dispcli-io`'s `write` maps its filesystem failures to
+    // the same kind): the document write succeeded, but completing the
+    // R8 output contract for that write did not, and that is this
+    // function's failure to report, not a reason to emit a value the
+    // contract doesn't allow.
     let document_path = std::fs::canonicalize(&out_path)
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| out_path.clone());
+        .map_err(|cause| {
+            Error::new(
+                ErrorKind::IoFailed,
+                format!(
+                    "document written to '{out_path}' but failed to canonicalize its \
+                     path for the R8 output contract: {cause}"
+                ),
+            )
+        })?;
 
     let total_bytes = assembled.components.iter().map(|c| c.bytes).sum();
     let mode = request.mode_override.unwrap_or(agent_entry.default_mode);
+
+    // R8 worktree block: `required` is the registry flag AND envelope.worktree
+    // being non-null — the registry flag alone is not sufficient (a
+    // worktree-requiring agent dispatched with no worktree still reports
+    // false). `commands` follows `required`, not `envelope.worktree.is_some()`
+    // alone — a dispatch whose agent does NOT require a worktree reports
+    // empty commands even when the caller happened to supply one (AC8.3).
+    let worktree_required = agent_entry.worktree_required && request.envelope.worktree.is_some();
+    let worktree_commands = match (worktree_required, &request.envelope.worktree) {
+        (true, Some(worktree_path)) => vec![vec![
+            "git".to_string(),
+            "-C".to_string(),
+            request.envelope.repo.clone(),
+            "worktree".to_string(),
+            "add".to_string(),
+            worktree_path.clone(),
+            "-b".to_string(),
+            request.envelope.branch.clone(),
+        ]],
+        _ => Vec::new(),
+    };
 
     Ok(Summary {
         document_path,
@@ -199,11 +265,9 @@ fn try_assemble(args: &AssembleArgs) -> Result<Summary, Error> {
         mode,
         working_dir,
         worktree: WorktreeSummary {
-            required: agent_entry.worktree_required,
+            required: worktree_required,
             path: request.envelope.worktree.clone(),
-            // Full argv-command generation is Task 10; v0 always reports
-            // an empty command list.
-            commands: Vec::new(),
+            commands: worktree_commands,
         },
         size: SizeSummary {
             total_bytes,

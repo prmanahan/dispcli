@@ -1,0 +1,47 @@
+# Single-pass placeholder substitution fixture (Task 10 red phase, R5).
+#
+# `skills/branch-echo.md` contains the literal token `{branch}` — the ONLY
+# placeholder in its content. Substitution is single-pass: a value
+# substituted for one placeholder must never be rescanned by a later
+# placeholder's substitution pass. `substitute_placeholders` processes
+# placeholders in this fixed order: dispatch_id, task_id, agent_name,
+# project_path, worktree_path, branch, report_path — `branch` runs before
+# `report_path` (last), so a `branch` value that contains the literal text
+# `{report_path}` is, today, incorrectly rescanned and replaced by the
+# subsequent report_path substitution pass (confirmed by manual probe:
+# `branch = "x{report_path}y"` -> assembled content reads
+# "...x/actual/report/path.mdy...", not the literal token). See
+# `request-report-path.json`.
+#
+# Ratified reading (dispatch 1705 amendment): once single-pass is fixed,
+# the surviving literal token is a SUPPORTED placeholder left unresolved in
+# a skill section -> AC5.2 assembly_failed (exit 6), not a silent pass-
+# through. The correct end-state for both `request-report-path.json` and
+# `request-task-id.json` is exit 6, not exit 0 — see the corresponding
+# test doc comments in `cmd/dispcli/tests/integration.rs` for the verbatim
+# AC5.2 quote.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.branch-echo]
+path = "skills/branch-echo.md"
+
+[patterns.implementation]
+skills = ["branch-echo"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"

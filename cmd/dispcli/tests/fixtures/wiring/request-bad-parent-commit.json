@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "standard",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: parent_commit is 39 chars (one short of R7's 40-hex requirement) -> validate_request must reject this before any output, end-to-end through the CLI.",
+  "envelope": {
+    "dispatch_id": 1101,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbee",
+    "repo": "/fixtures/repo",
+    "worktree": null,
+    "branch": "feature-t10-bad-sha",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

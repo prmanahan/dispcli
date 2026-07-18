@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "standard",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: [blocks.orphan-block] is declared and absent from blocks.order, and no weight class names it -> must be rejected as config_invalid per AC6.4 (every declared block must be ordered).",
+  "envelope": {
+    "dispatch_id": 603,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": null,
+    "branch": "feature-t10-orphan-block",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

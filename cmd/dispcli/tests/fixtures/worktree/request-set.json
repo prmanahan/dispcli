@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "standard",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: worktree_required=true, envelope.worktree=set -> required must be true, commands must carry the argv worktree-add command.",
+  "envelope": {
+    "dispatch_id": 502,
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": "/fixtures/repo/.worktrees/feature-t10-wt-set",
+    "branch": "feature-t10-wt-set",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

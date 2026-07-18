@@ -1,0 +1,27 @@
+{
+  "agent": "implementer",
+  "task_pattern": "implementation",
+  "tier": "t2",
+  "weight": "standard",
+  "mode_override": null,
+  "skills_add": [],
+  "skills_remove": [],
+  "task_body": "Fixture task: dispatch_id is a string instead of an integer -> serde shape failure, request_invalid, no panic.",
+  "envelope": {
+    "dispatch_id": "not-an-integer",
+    "task_id": null,
+    "spec_id": null,
+    "spec_version": null,
+    "parent_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "repo": "/fixtures/repo",
+    "worktree": null,
+    "branch": "feature-t10-wrong-type",
+    "report_path": null,
+    "deadline_minutes": null,
+    "command_scope_subtract": [],
+    "command_scope_add": [],
+    "touch_scope": [],
+    "forbid_scope": [],
+    "verify": []
+  }
+}

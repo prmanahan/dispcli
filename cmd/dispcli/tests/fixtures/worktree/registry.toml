@@ -1,0 +1,50 @@
+# Worktree fixture registry (Task 10 red phase, spec 0001 R8/AC8.3, the
+# `worktree.required`/`worktree.commands` block).
+#
+# Two agents so the 2x2 truth table on `required = worktree_required AND
+# envelope.worktree.is_some()` is fully exercised across the three fixture
+# requests (the fourth cell — both false — is already covered by the
+# existing Task 5 happy-path fixture):
+#   - `implementer`         (worktree_required = true)  x request-null   -> T AND F = false
+#   - `implementer`         (worktree_required = true)  x request-set    -> T AND T = true
+#   - `implementer-passive` (worktree_required = false) x request-passive-set -> F AND T = false
+#
+# `blocks.worktree-note` is `include = "worktree"` — included only when
+# `envelope.worktree` is non-null — so the request-set case also exercises
+# a genuinely dynamic block set / component count (AC5.1, AC8.1 byte
+# accounting) that the happy fixture's single always-included block never
+# does.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = true
+
+[agents.implementer-passive]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/core.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics", "worktree-note"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[blocks.worktree-note]
+path = "blocks/worktree-note.md"
+include = "worktree"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"

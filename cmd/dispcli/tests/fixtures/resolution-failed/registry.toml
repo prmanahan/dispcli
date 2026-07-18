@@ -1,0 +1,31 @@
+# resolution_failed (exit 5) CLI-level fixture (Task 10 red phase, AC3.3,
+# AC8.2). `skills.core` declares a path with no file on disk
+# ("skills/does-not-exist.md" is never created in this fixture directory
+# on purpose) -> `FsContentResolver::resolve` must surface a
+# `resolution_failed` error end-to-end through the CLI. Already covered at
+# the `dispcli-io` unit level; not yet exercised through the binary.
+
+[registry]
+skills_root = "skills"
+
+[agents.implementer]
+profile = "profile-implementer.md"
+default_mode = "bypassPermissions"
+worktree_required = false
+
+[skills.core]
+path = "skills/does-not-exist.md"
+
+[patterns.implementation]
+skills = ["core"]
+
+[blocks]
+order = ["metrics"]
+
+[blocks.metrics]
+path = "blocks/metrics.md"
+include = "always"
+
+[weights.standard]
+profile_sections = "all"
+blocks = "all"
